@@ -1,0 +1,51 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Espeon",
+  "version": "0.1.1",
+  "identifier": "local.jev.trading-harness",
+  "build": {
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Espeon",
+        "width": 1180,
+        "height": 760,
+        "minWidth": 760,
+        "minHeight": 600,
+        "decorations": false,
+        "shadow": false,
+        "transparent": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "nsis"
+    ],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.ico"
+    ],
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEM4M0MxNURERUU4OEZFNzgKUldSNC9vanUzUlU4eUhteGxGQ1kwTk5hS05mN0RSenhUaG02VlFYU2JZZ0FEUnFiSHA4WTZ6Wi8K",
+      "endpoints": [
+        "https://github.com/kangykii/espeon/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  }
+}

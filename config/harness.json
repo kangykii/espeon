@@ -1,0 +1,33 @@
+{
+  "brokerAdapter": "ctrader-fix",
+  "jevAdapter": "typesafe",
+  "minimumConfidence": 0.65,
+  "autonomousReview": {
+    "enabled": true,
+    "noTradeHorizonMode": "hypothesis_horizon",
+    "noTradeMinDecisions": 6,
+    "noTradeMaxDecisions": 20,
+    "consecutiveLossThreshold": 3,
+    "periodicTradeThreshold": 10,
+    "maxActiveLoops": 3,
+    "splitConfidenceThreshold": 0.8,
+    "retryAttempts": 3,
+    "retryBaseSeconds": 5
+  },
+  "riskPolicy": {
+    "duplicateOrderWindowSeconds": 300,
+    "maxConsecutiveFailures": 3,
+    "maxOpenPositionsPerLoop": 2,
+    "maxPositionFractionOfLoop": 0.5,
+    "maxSignalAgeSeconds": 300,
+    "maxTotalExposureFraction": 0.8,
+    "minimumOrderNotional": 25.0,
+    "paperAccountCapital": 100000.0,
+    "paperReferencePrice": 100.0,
+    "quantityStep": 0.0001,
+    "retryBaseSeconds": 5,
+    "stopLossBasisPoints": 200
+  },
+  "runtimeDirectory": "runtime-harness",
+  "worldModelAdapter": "openrouter"
+}

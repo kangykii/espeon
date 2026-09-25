@@ -1,0 +1,8 @@
+{
+  "experiment": "illustrative_dates_replace_before_preregistration",
+  "folds": [
+    {"id":"oos-1","train_end":"2026-09-01T00:00:00Z","test_start":"2026-09-02T00:00:00Z","test_end":"2026-10-01T00:00:00Z"},
+    {"id":"oos-2","train_end":"2026-10-01T00:00:00Z","test_start":"2026-10-02T00:00:00Z","test_end":"2026-11-01T00:00:00Z"},
+    {"id":"oos-3","train_end":"2026-11-01T00:00:00Z","test_start":"2026-11-02T00:00:00Z","test_end":"2026-12-01T00:00:00Z"}
+  ]
+}

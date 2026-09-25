@@ -1,0 +1,15 @@
+{
+  "version": "pullback-v1.0",
+  "context": {
+    "bias": {"type":"choice","instructions":"Using only closed H1/H4 price structure, classify directional agreement. Ignore candidate direction. Missing evidence is MIXED.","criteria":{"LONG":"Both horizons support rising structure.","SHORT":"Both horizons support falling structure.","MIXED":"Conflicting, flat, or insufficient structure."}},
+    "regime": {"type":"choice","instructions":"Classify current market structure from closed bars. Distinguish persistent directional progress from overlapping balance and unstable price discovery.","criteria":{"TREND":"Coherent directional progress with contained retracements.","BALANCE":"Overlapping, two-sided, noisy movement.","DISLOCATED":"Gaps or violent discontinuous movement.","UNKNOWN":"Insufficient evidence."}},
+    "participation": {"type":"choice","instructions":"Does observed participation support continuation? Tick volume is only broker activity, never traded volume or order flow. Missing depth is not evidence of liquidity.","criteria":{"SUPPORTS":"Available observations support participation.","WEAK":"Observed participation contradicts continuation.","UNKNOWN":"Evidence is insufficient."}}
+  },
+  "setup": {
+    "direction": {"type":"choice","instructions":"Assess a trend-continuation pullback for the next 45–90 minutes using closed structure, location, volatility, VWAP proxy, participation, levels, and context. Choose NONE for broken structure, poor location, contradictions, or insufficient evidence. Do not forecast profit or set risk.","criteria":{"LONG":"Orderly bullish pullback with renewed upward progress.","SHORT":"Orderly bearish pullback with renewed downward progress.","NONE":"No sufficiently coherent continuation setup."}},
+    "pullback": {"type":"choice","instructions":"Does the latest retracement preserve the directional structure selected by context? Inspect overlap and depth, not indicator agreement.","criteria":{"ORDERLY":"Contained retracement preserves structure.","BROKEN":"Retracement damages structure.","UNCLEAR":"Ambiguous or absent retracement."}},
+    "resumption": {"type":"choice","instructions":"Does the last closed M15 bar show convincing renewed progress in the context direction, relative to recent bars?",
+      "criteria":{"RESUMING":"Renewed directional progress.","UNCONFIRMED":"Weak or contradictory evidence."}},
+    "timing": {"type":"choice","instructions":"Assess entry location relative to recent range, volatility, VWAP proxy, and nearby opposing levels.","criteria":{"TIMELY":"Room remains without chasing an extended move.","LATE":"Extended or obstructed entry.","UNCLEAR":"Insufficient location evidence."}}
+  }
+}

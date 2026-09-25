@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net6.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../JevPullbackBot.cs" Link="JevPullbackBot.cs" />
+    <Compile Include="CoreTests.cs" />
+    <Reference Include="cAlgo.API"><HintPath>$(ApiAssemblyPath)</HintPath></Reference>
+  </ItemGroup>
+  <Target Name="RequireApiPath" BeforeTargets="ResolveReferences">
+    <Error Condition="!Exists('$(ApiAssemblyPath)')" Text="Provide /p:ApiAssemblyPath=absolute path to your installed cAlgo.API.dll" />
+  </Target>
+</Project>

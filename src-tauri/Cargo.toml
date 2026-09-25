@@ -1,0 +1,32 @@
+[package]
+name = "espeon"
+version = "0.1.1"
+description = "Espeon desktop trading workbench"
+edition = "2021"
+
+[lib]
+name = "jev_harness_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+dotenvy = "0.15"
+parking_lot = "0.12"
+prost = "0.14"
+native-tls = "0.2"
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "query", "rustls"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tauri = { version = "2", features = [] }
+tauri-plugin-updater = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tempfile = "3"
+

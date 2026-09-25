@@ -1,0 +1,10 @@
+{
+  "AsOfUtc": "2026-09-20T00:00:00Z",
+  "CoverageFromUtc": "2026-09-20T00:00:00Z",
+  "CoverageToUtc": "2026-09-22T00:00:00Z",
+  "Symbol": "BTCUSD",
+  "Source": "REPLACE_WITH_VERIFIED_POINT_IN_TIME_PROVIDER",
+  "Events": [
+    {"Id":"illustrative-only","TimeUtc":"2026-09-21T12:30:00Z","KnownAtUtc":"2026-09-20T00:00:00Z","Impact":"HIGH","Name":"Illustrative event, not a real calendar"}
+  ]
+}

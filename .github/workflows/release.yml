@@ -1,0 +1,68 @@
+name: Release Espeon
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - name: Install frontend dependencies
+        run: npm ci
+      - name: Confirm release version
+        shell: pwsh
+        run: |
+          $version = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          if ("v$version" -ne '${{ github.ref_name }}') { throw "Tag must match Tauri version v$version" }
+      - name: Build signed Windows installer
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+        run: npm run tauri:build
+      - name: Publish signed private release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = '${{ github.ref_name }}'
+          $repo = '${{ github.repository }}'
+          $installer = Get-ChildItem 'src-tauri/target/release/bundle/nsis/*-setup.exe' | Select-Object -First 1
+          if (-not $installer) { throw 'NSIS installer missing' }
+          $signature = Get-Item "$($installer.FullName).sig"
+          gh release create $tag $installer.FullName $signature.FullName --repo $repo --draft --verify-tag --title "Espeon $tag" --notes "Signed Espeon desktop release."
+          if ($LASTEXITCODE -ne 0) { throw 'Release creation failed' }
+          $release = gh api "repos/$repo/releases/tags/$tag" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw 'Release lookup failed' }
+          $asset = $release.assets | Where-Object name -eq $installer.Name | Select-Object -First 1
+          if (-not $asset) { throw 'Installer release asset missing' }
+          $manifest = @{
+            version = $tag.TrimStart('v')
+            notes = 'Signed Espeon desktop release.'
+            pub_date = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+            platforms = @{
+              'windows-x86_64' = @{
+                signature = (Get-Content $signature.FullName -Raw).Trim()
+                url = "https://api.github.com/repos/$repo/releases/assets/$($asset.id)"
+              }
+            }
+          }
+          $manifest | ConvertTo-Json -Depth 8 | Set-Content latest.json -Encoding utf8
+          gh release upload $tag latest.json --repo $repo
+          if ($LASTEXITCODE -ne 0) { throw 'Updater manifest upload failed' }
+          gh release edit $tag --repo $repo --draft=false --latest
+          if ($LASTEXITCODE -ne 0) { throw 'Release publication failed' }

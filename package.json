@@ -1,0 +1,23 @@
+{
+  "name": "espeon",
+  "private": true,
+  "version": "0.1.1",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --port 1420",
+    "build": "tsc && vite build",
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev --config src-tauri/tauri.dev.conf.json",
+    "tauri:build": "tauri build"
+  },
+  "dependencies": {
+    "@fontsource/ibm-plex-sans": "^5.3.0",
+    "@tauri-apps/api": "^2.8.0",
+    "lucide": "^1.48.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.8.0",
+    "typescript": "^5.9.2",
+    "vite": "^7.1.7"
+  }
+}
