@@ -46,8 +46,8 @@ jobs:
           $signature = Get-Item "$($installer.FullName).sig"
           gh release create $tag $installer.FullName $signature.FullName --repo $repo --draft --verify-tag --title "Espeon $tag" --notes "Signed Espeon desktop release."
           if ($LASTEXITCODE -ne 0) { throw 'Release creation failed' }
-          $release = gh api "repos/$repo/releases/tags/$tag" | ConvertFrom-Json
-          if ($LASTEXITCODE -ne 0) { throw 'Release lookup failed' }
+          $release = (gh api "repos/$repo/releases?per_page=100" | ConvertFrom-Json) | Where-Object tag_name -eq $tag | Select-Object -First 1
+          if ($LASTEXITCODE -ne 0 -or -not $release) { throw 'Release lookup failed' }
           $asset = $release.assets | Where-Object name -eq $installer.Name | Select-Object -First 1
           if (-not $asset) { throw 'Installer release asset missing' }
           $manifest = @{
