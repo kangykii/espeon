@@ -6,7 +6,7 @@ Espeon is a Windows desktop workbench for supervised Jev trading experiments. It
 
 Install Node.js, Rust, and the Windows Tauri build prerequisites. Run `npm ci` and `npm run tauri:dev` from the repository root. The dev command starts Vite through `src-tauri/tauri.dev.conf.json`. A normal release build embeds the frontend and does not need a localhost server.
 
-Local connector secrets live in the ignored `.env` file; adapter defaults live in `config/harness.json`. Runtime data in `runtime-harness/` is ignored. A fresh installed app creates a simulated local configuration under `%LOCALAPPDATA%\Espeon` when the source tree is absent. The Qdrant retrieval bridge requires a local Python environment and its dependencies.
+Local connector secrets live in the ignored `.env` file; adapter defaults live in `config/harness.json`. Runtime data in `runtime-harness/` is ignored. A fresh installed app creates a simulated local configuration under `%LOCALAPPDATA%\EspeonData` when the source tree is absent. The Qdrant retrieval bridge requires a local Python environment and its dependencies.
 
 ## Releases and updates
 

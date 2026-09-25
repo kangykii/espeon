@@ -274,17 +274,21 @@ async function checkForUpdates(): Promise<void> {
   if (state.settingsOpen) render();
   try {
     updateStatus = await harnessService.checkForUpdates();
-    if (updateStatus.state === "waiting") {
-      state.notice = updateStatus.message;
-      state.noticeTone = "neutral";
+    if (updateStatus.state === "waiting" || updateStatus.state === "error") {
+      if (updateStatus.state === "waiting") {
+        state.notice = updateStatus.message;
+        state.noticeTone = "neutral";
+      }
       if (updateRetryTimer !== null) window.clearTimeout(updateRetryTimer);
-      updateRetryTimer = window.setTimeout(() => void checkForUpdates(), 60_000);
+      updateRetryTimer = window.setTimeout(() => void checkForUpdates(), updateStatus.state === "waiting" ? 60_000 : 15 * 60_000);
     } else if (updateRetryTimer !== null) {
       window.clearTimeout(updateRetryTimer);
       updateRetryTimer = null;
     }
   } catch (error) {
     updateStatus = { state: "error", message: `Update check failed: ${String(error)}`, version: null };
+    if (updateRetryTimer !== null) window.clearTimeout(updateRetryTimer);
+    updateRetryTimer = window.setTimeout(() => void checkForUpdates(), 15 * 60_000);
   } finally {
     updateChecking = false;
     if (state.settingsOpen || updateStatus?.state === "waiting") render();

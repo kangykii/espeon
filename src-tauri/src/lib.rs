@@ -34,6 +34,7 @@ struct AppState {
     restored_run_ids: Vec<String>,
     project_root: PathBuf,
     retrieval_ready: bool,
+    installing_update: Arc<AtomicBool>,
     run_cancellations: Mutex<HashMap<String, Arc<AtomicBool>>>,
 }
 
@@ -51,7 +52,7 @@ impl AppState {
             let local = std::env::var("LOCALAPPDATA")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| std::env::temp_dir());
-            local.join("Espeon")
+            local.join("EspeonData")
         };
         let config_path = project_root.join("config").join("harness.json");
         if !config_path.is_file() {
@@ -152,6 +153,7 @@ impl AppState {
             restored_run_ids: restored,
             project_root,
             retrieval_ready,
+            installing_update: Arc::new(AtomicBool::new(false)),
             run_cancellations: Mutex::new(HashMap::new()),
         })
     }
@@ -322,11 +324,13 @@ async fn start_run(
     app: AppHandle,
 ) -> Result<RunSnapshot, String> {
     let controller = Arc::clone(&state.controller);
+    let installing_update = Arc::clone(&state.installing_update);
     let snapshot = tauri::async_runtime::spawn_blocking(move || {
-        controller
-            .lock()
-            .start(&thesis)
-            .map_err(|error| error.to_string())
+        let mut controller = controller.lock();
+        if installing_update.load(Ordering::SeqCst) {
+            return Err("Espeon is installing an update; start the experiment after restart.".into());
+        }
+        controller.start(&thesis).map_err(|error| error.to_string())
     })
     .await
     .map_err(|error| format!("start-run worker failed: {error}"))??;
@@ -558,8 +562,12 @@ async fn hydrate_workspace(state: State<'_, AppState>) -> Result<WorkspaceSnapsh
 
 #[tauri::command]
 async fn check_for_updates(app: AppHandle, state: State<'_, AppState>) -> Result<updates::UpdateStatus, String> {
-    let active_runs = state.controller.lock().has_active_runs();
-    Ok(updates::check(app, &state.project_root, active_runs).await)
+    Ok(updates::check(
+        app,
+        &state.project_root,
+        Arc::clone(&state.controller),
+        Arc::clone(&state.installing_update),
+    ).await)
 }
 
 #[tauri::command]

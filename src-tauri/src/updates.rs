@@ -1,7 +1,10 @@
+use crate::harness::HarnessController;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tauri::AppHandle;
 use tauri_plugin_updater::UpdaterExt;
@@ -41,13 +44,15 @@ impl Drop for CheckGuard {
 }
 
 fn github_token(project_root: &Path) -> Option<String> {
-    let from_env = std::env::var("ESPEON_GITHUB_TOKEN").ok();
+    let from_env = std::env::var("ESPEON_GITHUB_TOKEN").ok()
+        .filter(|value| !value.trim().is_empty());
     let from_file = std::fs::read_to_string(project_root.join(".env"))
         .ok()
         .and_then(|contents| contents.lines().filter_map(|line| line.split_once('='))
             .find(|(name, _)| name.trim() == "ESPEON_GITHUB_TOKEN")
-            .map(|(_, value)| value.trim().to_owned()));
-    if let Some(token) = from_env.or(from_file).filter(|value| !value.trim().is_empty()) {
+            .map(|(_, value)| value.trim().to_owned()))
+        .filter(|value| !value.is_empty());
+    if let Some(token) = from_env.or(from_file) {
         return Some(token);
     }
 
@@ -63,7 +68,12 @@ fn github_token(project_root: &Path) -> Option<String> {
     }).map(|value| value.trim().to_owned()).filter(|value| !value.is_empty())
 }
 
-pub async fn check(app: AppHandle, project_root: &Path, active_runs: bool) -> UpdateStatus {
+pub async fn check(
+    app: AppHandle,
+    project_root: &Path,
+    controller: Arc<Mutex<HarnessController>>,
+    installing: Arc<AtomicBool>,
+) -> UpdateStatus {
     if CHECKING.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
         return UpdateStatus::new("checking", "An update check is already running.", None);
     }
@@ -71,13 +81,18 @@ pub async fn check(app: AppHandle, project_root: &Path, active_runs: bool) -> Up
     let Some(token) = github_token(project_root) else {
         return UpdateStatus::new("authRequired", "Connect GitHub in settings to receive private releases.", None);
     };
-    match check_authenticated(app, &token, active_runs).await {
+    match check_authenticated(app, &token, controller, installing).await {
         Ok(status) => status,
         Err(error) => UpdateStatus::new("error", error, None),
     }
 }
 
-async fn check_authenticated(app: AppHandle, token: &str, active_runs: bool) -> Result<UpdateStatus, String> {
+async fn check_authenticated(
+    app: AppHandle,
+    token: &str,
+    controller: Arc<Mutex<HarnessController>>,
+    installing: Arc<AtomicBool>,
+) -> Result<UpdateStatus, String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
@@ -89,7 +104,7 @@ async fn check_authenticated(app: AppHandle, token: &str, active_runs: bool) -> 
         .send().await
         .map_err(|error| format!("Could not reach GitHub releases: {error}"))?;
     if response.status() == reqwest::StatusCode::NOT_FOUND {
-        return Ok(UpdateStatus::new("current", "No published Espeon release is available yet.", None));
+        return Ok(UpdateStatus::new("authRequired", "No release is available, or this GitHub account cannot access it.", None));
     }
     if response.status() == reqwest::StatusCode::UNAUTHORIZED || response.status() == reqwest::StatusCode::FORBIDDEN {
         return Ok(UpdateStatus::new("authRequired", "GitHub access expired. Update the read-only token in settings.", None));
@@ -111,10 +126,19 @@ async fn check_authenticated(app: AppHandle, token: &str, active_runs: bool) -> 
         return Ok(UpdateStatus::new("current", "Espeon is up to date.", None));
     };
     let version = update.version.clone();
-    if active_runs {
+    if controller.lock().has_active_runs() {
         return Ok(UpdateStatus::new("waiting", "Update ready; installation waits until active experiments stop.", Some(version)));
     }
-    update.download_and_install(|_, _| {}, || {})
-        .await.map_err(|error| format!("Update installation failed: {error}"))?;
+    let package = update.download(|_, _| {}, || {})
+        .await.map_err(|error| format!("Update download or signature verification failed: {error}"))?;
+    installing.store(true, Ordering::SeqCst);
+    if controller.lock().has_active_runs() {
+        installing.store(false, Ordering::SeqCst);
+        return Ok(UpdateStatus::new("waiting", "Update ready; installation waits until active experiments stop.", Some(version)));
+    }
+    if let Err(error) = update.install(package) {
+        installing.store(false, Ordering::SeqCst);
+        return Err(format!("Update installation failed: {error}"));
+    }
     app.restart();
 }

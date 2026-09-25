@@ -1,6 +1,6 @@
 [package]
 name = "espeon"
-version = "0.1.1"
+version = "0.1.2"
 description = "Espeon desktop trading workbench"
 edition = "2021"
 
@@ -29,4 +29,5 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
 tempfile = "3"
+
 
