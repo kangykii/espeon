@@ -4,13 +4,16 @@ use crate::replay;
 use crate::storage::CanonicalStore;
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -31,6 +34,13 @@ impl RetrievalConfig {
         let storage_path = std::env::var("QDRANT_LOCAL_PATH")
             .map(PathBuf::from)
             .unwrap_or_else(|_| runtime_root.join("qdrant"));
+        let configured_collection = std::env::var("QDRANT_COLLECTION")
+            .unwrap_or_else(|_| "jev_context_pool".into());
+        let collection = if configured_collection.ends_with("_evidence_v2") {
+            configured_collection
+        } else {
+            format!("{configured_collection}_evidence_v2")
+        };
         Ok(Self {
             python_path: project_root
                 .join(".venv")
@@ -41,8 +51,7 @@ impl RetrievalConfig {
                 .join("qdrant_local_bridge.py"),
             storage_path,
             models_path: runtime_root.join("models"),
-            collection: std::env::var("QDRANT_COLLECTION")
-                .unwrap_or_else(|_| "jev_context_pool".into()),
+            collection,
         })
     }
 }
@@ -50,6 +59,7 @@ impl RetrievalConfig {
 #[derive(Clone)]
 pub struct QdrantContextPool {
     config: RetrievalConfig,
+    bridge_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -80,7 +90,10 @@ impl QdrantContextPool {
                 config.python_path.display()
             );
         }
-        let pool = Self { config };
+        let pool = Self {
+            config,
+            bridge_lock: Arc::new(Mutex::new(())),
+        };
         let response = pool.execute(json!({ "action": "init" }))?;
         if response.get("ready").and_then(Value::as_bool) != Some(true) {
             bail!("Qdrant local bridge did not report ready");
@@ -128,14 +141,38 @@ impl QdrantContextPool {
         if records.is_empty() {
             return Ok(());
         }
-        let payloads: Vec<Value> = records.iter().map(payload).collect();
+        let mut index_records = Vec::new();
+        for record in records {
+            for (point_id, text, chunk_index, chunk_count) in
+                crate::evidence::index_chunks(&record.text, &record.id)
+            {
+                let mut chunk = record.clone();
+                chunk.id = point_id;
+                chunk.text = text;
+                chunk.content_sha256 = format!("{:x}", Sha256::digest(chunk.text.as_bytes()));
+                chunk.metadata = crate::evidence::compact_index_value(&chunk.metadata);
+                if !chunk.metadata.is_object() {
+                    chunk.metadata = json!({});
+                }
+                chunk.metadata["indexChunk"] = json!({
+                    "index": chunk_index,
+                    "count": chunk_count,
+                    "version": 2
+                });
+                index_records.push(chunk);
+            }
+        }
+        let payloads: Vec<Value> = index_records.iter().map(payload).collect();
         let response = self.execute(json!({ "action": "upsert", "records": payloads }))?;
         let count = response
             .get("upserted")
             .and_then(Value::as_u64)
             .unwrap_or_default();
-        if count != records.len() as u64 {
-            bail!("Qdrant acknowledged {count} of {} records", records.len());
+        if count != index_records.len() as u64 {
+            bail!(
+                "Qdrant acknowledged {count} of {} indexed evidence chunks",
+                index_records.len()
+            );
         }
         Ok(())
     }
@@ -155,6 +192,47 @@ impl QdrantContextPool {
                 .collect::<Vec<_>>(),
         )?;
         Ok(records.len())
+    }
+
+    /// Backfill the versioned compact index once. The ready marker is written
+    /// only after every canonical event has been indexed successfully, so a
+    /// crash retries the idempotent deterministic point IDs on next launch.
+    pub fn rebuild_if_needed(&self, store: &CanonicalStore) -> Result<bool> {
+        let marker = self.config.storage_path.join(format!(
+            ".{}.source-index-v2.ready",
+            self.config.collection
+        ));
+        if marker.is_file() {
+            return Ok(false);
+        }
+
+        for run in store.run_summaries()? {
+            let events = store.stored_events(&run.run_id)?;
+            if events.is_empty() {
+                continue;
+            }
+            let state = replay::replay_run(store, &run.run_id)?;
+            const EVENT_BATCH: usize = 48;
+            for batch in events.chunks(EVENT_BATCH) {
+                let records = batch
+                    .iter()
+                    .map(|stored| event_record(stored, &state))
+                    .collect::<Vec<_>>();
+                self.upsert(&records)?;
+            }
+            store.mark_retrieval_events_indexed(
+                &events
+                    .iter()
+                    .map(|stored| stored.event.id.clone())
+                    .collect::<Vec<_>>(),
+            )?;
+        }
+
+        std::fs::create_dir_all(&self.config.storage_path)?;
+        let temporary = marker.with_extension("ready.tmp");
+        std::fs::write(&temporary, "evidence-index-v2\n")?;
+        std::fs::rename(&temporary, &marker)?;
+        Ok(true)
     }
 
     fn search(
@@ -186,6 +264,7 @@ impl QdrantContextPool {
     }
 
     fn execute(&self, request: impl Serialize) -> Result<Value> {
+        let _bridge_guard = self.bridge_lock.lock();
         let mut command = Command::new(&self.config.python_path);
         command
             .arg(&self.config.bridge_path)
@@ -215,17 +294,44 @@ impl QdrantContextPool {
         })?;
         child
             .stdin
-            .as_mut()
+            .take()
             .context("open Qdrant bridge stdin")?
             .write_all(serde_json::to_string(&request)?.as_bytes())?;
-        let output = child.wait_with_output()?;
-        if !output.status.success() {
+        let mut stdout = child.stdout.take().context("open Qdrant bridge stdout")?;
+        let mut stderr = child.stderr.take().context("open Qdrant bridge stderr")?;
+        let stdout_reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stdout.read_to_end(&mut bytes).map(|_| bytes)
+        });
+        let stderr_reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stderr.read_to_end(&mut bytes).map(|_| bytes)
+        });
+        let deadline = Instant::now() + Duration::from_secs(12);
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                child.kill().ok();
+                child.wait().ok();
+                bail!("Qdrant bridge exceeded its 12-second operation limit");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let output = stdout_reader
+            .join()
+            .map_err(|_| anyhow::anyhow!("Qdrant stdout reader failed"))??;
+        let error_output = stderr_reader
+            .join()
+            .map_err(|_| anyhow::anyhow!("Qdrant stderr reader failed"))??;
+        if !status.success() {
             bail!(
                 "Qdrant bridge failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
+                String::from_utf8_lossy(&error_output).trim()
             );
         }
-        serde_json::from_slice(&output.stdout).context("decode Qdrant bridge response")
+        serde_json::from_slice(&output).context("decode Qdrant bridge response")
     }
 }
 
@@ -443,6 +549,14 @@ fn payload(record: &ContextPoolRecord) -> Value {
 }
 
 fn event_record(stored: &StoredEvent, state: &ReplayState) -> ContextPoolRecord {
+    if stored.event.kind == "context_record_ingested" {
+        if let Some(record) = stored.event.payload.get("record") {
+            if let Ok(mut record) = serde_json::from_value::<ContextPoolRecord>(record.clone()) {
+                record.observed_at = stored.event.occurred_at;
+                return record;
+            }
+        }
+    }
     let dimensions = memory_dimensions(stored, state);
     let instruments = dimensions["instruments"]
         .as_array()
@@ -467,11 +581,12 @@ fn event_record(stored: &StoredEvent, state: &ReplayState) -> ContextPoolRecord 
     if is_experiment_memory(&stored.event.kind) {
         tags.push("experiment-memory".into());
     }
+    let index_payload = crate::evidence::compact_index_value(&stored.event.payload);
     let mut record = QdrantContextPool::create_record(
         &stored.event.run_id,
         &format!("{} | {} | {}", stored.event.kind, instruments, timeframe),
         &format!(
-            "{} Outcome: {}. Instruments: {}. Timeframe: {}. Canonical record: {} {}. Payload: {}",
+            "{} Outcome: {}. Instruments: {}. Timeframe: {}. Canonical record: {} {}. Evidence: {}",
             stored
                 .event
                 .payload
@@ -483,7 +598,7 @@ fn event_record(stored: &StoredEvent, state: &ReplayState) -> ContextPoolRecord 
             timeframe,
             stored.event.aggregate_type,
             stored.event.aggregate_id,
-            stored.event.payload
+            index_payload
         ),
         ContextSourceClass::InternalCanonical,
         TrustLevel::Internal,
@@ -509,6 +624,7 @@ fn event_record(stored: &StoredEvent, state: &ReplayState) -> ContextPoolRecord 
             "canonical_event_uri": format!("canonical-event://{}", stored.event.id),
         }),
     );
+    record.id = stored.event.id.clone();
     record.observed_at = stored.event.occurred_at;
     record
 }

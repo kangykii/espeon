@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
+pub const ORDER_FILL_QUANTITY_TOLERANCE: f64 = 1e-7;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThesisVersion {
@@ -87,6 +89,9 @@ pub struct HypothesisDefinition {
     pub thesis_version_id: String,
     pub context_version_id: String,
     pub status: String,
+    /// Absent in historical runs. New loops require a validated ACTIVE contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract: Option<crate::contracts::HypothesisContract>,
     pub created_by_event_id: String,
     pub created_at: DateTime<Utc>,
 }
@@ -258,6 +263,8 @@ pub struct LiveContextSpec {
     pub id: String,
     pub version: i64,
     pub instrument: String,
+    #[serde(default)]
+    pub series_sources: std::collections::HashMap<String, String>,
     pub fields: Vec<LiveContextFieldSpec>,
     pub created_at: DateTime<Utc>,
 }
@@ -288,6 +295,14 @@ pub struct Candle {
     pub low: f64,
     pub close: f64,
     pub tick_volume: u64,
+    #[serde(default)]
+    pub provider_volume: Option<f64>,
+    #[serde(default)]
+    pub volume_kind: Option<String>,
+    #[serde(default)]
+    pub received_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub source_observation_ids: Vec<String>,
     pub closed: bool,
     pub provenance: String,
 }
@@ -297,6 +312,8 @@ pub struct Candle {
 pub struct SeriesRequirement {
     pub period: MarketDataPeriod,
     pub bars: usize,
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -313,6 +330,8 @@ pub struct MarketDataSnapshot {
     pub quote: QuoteSnapshot,
     pub candles: Vec<Candle>,
     pub captured_at: DateTime<Utc>,
+    #[serde(default)]
+    pub quality_state: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -342,6 +361,8 @@ pub struct ResolvedContextSnapshot {
     pub candles: Vec<Candle>,
     pub fields: Vec<ResolvedLiveField>,
     pub freshness_state: String,
+    #[serde(default)]
+    pub quality_state: String,
     pub resolved_at: DateTime<Utc>,
     pub created_by_event_id: String,
 }
@@ -461,6 +482,9 @@ pub struct HypothesisReviewDecision {
     pub proposed_mechanism: Option<String>,
     pub proposed_timeframe: Option<TimeframeDefinition>,
     pub candidate_hypothesis: Option<CandidateHypothesis>,
+    /// Full DRAFT proposal for MODIFY/SPLIT. Legacy review events omit this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposed_contract: Option<crate::contracts::HypothesisContractDraft>,
     #[serde(default)]
     pub routing: Option<WorldModelRoutingMetadata>,
     #[serde(default)]
@@ -553,11 +577,17 @@ pub struct WorldModelReviewPackage {
 
 #[derive(Debug, Clone)]
 pub struct WorldModelStartupOutput {
-    pub thesis: ThesisVersion,
-    pub context_definition: ContextDefinition,
-    pub context: ContextVersion,
-    pub hypothesis: HypothesisDefinition,
+    pub contract: crate::contracts::HypothesisContractDraft,
     pub retrieval_trace: Option<RetrievalTrace>,
+    pub web_research_unavailable: bool,
+    pub broker_context_unavailable: Option<BrokerContextFailure>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BrokerContextFailure {
+    pub requested_capabilities: Vec<String>,
+    pub error: String,
+    pub recovery_reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -687,6 +717,8 @@ pub struct GuardrailDecision {
 #[serde(rename_all = "camelCase")]
 pub struct RiskPolicyConfig {
     pub paper_account_capital: f64,
+    #[serde(default = "default_paper_account_currency")]
+    pub paper_account_currency: String,
     pub max_total_exposure_fraction: f64,
     pub max_position_fraction_of_loop: f64,
     pub minimum_order_notional: f64,
@@ -698,6 +730,10 @@ pub struct RiskPolicyConfig {
     pub max_consecutive_failures: u32,
     pub retry_base_seconds: u64,
     pub paper_reference_price: f64,
+}
+
+fn default_paper_account_currency() -> String {
+    "USD".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -737,6 +773,7 @@ impl Default for RiskPolicyConfig {
     fn default() -> Self {
         Self {
             paper_account_capital: 100_000.0,
+            paper_account_currency: "USD".into(),
             max_total_exposure_fraction: 0.8,
             max_position_fraction_of_loop: 0.5,
             minimum_order_notional: 25.0,
@@ -815,6 +852,8 @@ pub struct ExecutionReceipt {
     pub filled_quantity: f64,
     pub average_price: Option<f64>,
     pub rejection_reason: Option<String>,
+    #[serde(default)]
+    pub raw_fix_report: Option<Vec<(String, String)>>,
     pub created_by_event_id: String,
     pub executed_at: DateTime<Utc>,
 }
@@ -1075,9 +1114,11 @@ pub struct EventView {
     pub kind: String,
     pub aggregate_type: String,
     pub aggregate_id: String,
+    pub loop_id: Option<String>,
     pub causation_event_id: Option<String>,
     pub occurred_at: DateTime<Utc>,
     pub summary: String,
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

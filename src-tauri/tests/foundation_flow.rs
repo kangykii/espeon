@@ -2,14 +2,22 @@
 mod adapters;
 #[path = "../src/context.rs"]
 mod context;
+#[path = "../src/contracts.rs"]
+mod contracts;
 #[path = "../src/ctrader_fix.rs"]
 mod ctrader_fix;
 #[path = "../src/domain.rs"]
 mod domain;
+#[path = "../src/freshness.rs"]
+mod freshness;
 #[path = "../src/harness.rs"]
 mod harness;
+#[path = "../src/jev_compiler.rs"]
+mod jev_compiler;
 #[path = "../src/market_data.rs"]
 mod market_data;
+#[path = "../src/mcp_context.rs"]
+mod mcp_context;
 #[path = "../src/ports.rs"]
 mod ports;
 #[path = "../src/replay.rs"]
@@ -18,6 +26,8 @@ mod replay;
 mod retrieval;
 #[path = "../src/risk.rs"]
 mod risk;
+#[path = "../src/skills.rs"]
+mod skills;
 #[path = "../src/storage.rs"]
 mod storage;
 
@@ -36,6 +46,31 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use storage::CanonicalStore;
 
+fn fixture_risk_snapshot(instruments: &[String]) -> ports::BrokerRiskSnapshot {
+    ports::BrokerRiskSnapshot {
+        account_id: "fixture-account".into(),
+        environment: "demo".into(),
+        equity: 10_000.0,
+        free_margin: 10_000.0,
+        deposit_asset_id: "USD".into(),
+        deposit_currency_code: "USD".into(),
+        observed_at: chrono::Utc::now(),
+        account_open_exposure: 0.0,
+        quote_to_deposit: instruments
+            .iter()
+            .cloned()
+            .map(|instrument| (instrument, 1.0))
+            .collect(),
+    }
+}
+
+fn fixture_account_identity() -> ports::BrokerAccountIdentity {
+    ports::BrokerAccountIdentity {
+        account_id: "fixture-account".into(),
+        environment: "demo".into(),
+    }
+}
+
 #[test]
 fn canonical_events_replay_the_complete_run_without_search_index() {
     let directory = tempfile::tempdir().unwrap();
@@ -47,16 +82,16 @@ fn canonical_events_replay_the_complete_run_without_search_index() {
         .start("Compare BTC continuation with a competing context")
         .unwrap();
     assert_eq!(started.loops.len(), 1);
+    controller.run_cycle(&started.run_id).unwrap();
     let active = controller
         .review_hypothesis(&HypothesisReviewRequest {
             run_id: started.run_id.clone(),
             hypothesis_id: started.hypotheses[0].id.clone(),
-            evidence_query:
-                "credible evidence supports a competing timeframe; split the experiment".into(),
+            evidence_query: "evidence remains supportive; keep the hypothesis".into(),
         })
         .unwrap();
     assert_eq!(active.status, "active");
-    assert_eq!(active.loops.len(), 2);
+    assert_eq!(active.loops.len(), 1);
     assert_eq!(active.positions.len(), 1);
 
     let stopped = controller.stop(&active.run_id).unwrap();
@@ -77,21 +112,21 @@ fn canonical_events_replay_the_complete_run_without_search_index() {
         replayed.human_thesis,
         "Compare BTC continuation with a competing context"
     );
-    assert_eq!(replayed.thesis_versions.len(), 2);
+    assert_eq!(replayed.thesis_versions.len(), 1);
     assert_eq!(replayed.context_definitions.len(), 1);
-    assert_eq!(replayed.context_versions.len(), 2);
-    assert_eq!(replayed.hypotheses.len(), 2);
+    assert_eq!(replayed.context_versions.len(), 1);
+    assert_eq!(replayed.hypotheses.len(), 1);
     assert_eq!(replayed.hypothesis_reviews.len(), 1);
-    assert_eq!(replayed.cadences.len(), 2);
-    assert_eq!(replayed.loops.len(), 2);
-    assert_eq!(replayed.decisions.len(), 3);
+    assert_eq!(replayed.cadences.len(), 1);
+    assert_eq!(replayed.loops.len(), 1);
+    assert_eq!(replayed.decisions.len(), 2);
     assert_eq!(replayed.executions.len(), 2);
     assert_eq!(replayed.positions.len(), 1);
     assert_eq!(replayed.orders.len(), 2);
     assert_eq!(replayed.position_controls.len(), 1);
-    assert_eq!(replayed.reviews.len(), 1);
+    assert_eq!(replayed.reviews.len(), 0);
     assert_eq!(replayed.capital_allocations.len(), 2);
-    assert_eq!(replayed.memory_documents.len(), 1);
+    assert!(replayed.memory_documents.is_empty());
 
     let thesis_id = &replayed.thesis_versions[0].id;
     let context_id = &replayed.context_versions[0].id;
@@ -112,21 +147,10 @@ fn canonical_events_replay_the_complete_run_without_search_index() {
     let child = replayed
         .loops
         .iter()
-        .find(|loop_state| loop_state.parent_loop_id.is_some())
+        .find(|loop_state| loop_state.parent_loop_id.is_none())
         .unwrap();
-    assert_eq!(
-        child.parent_thesis_version_id.as_deref(),
-        Some(thesis_id.as_str())
-    );
+    assert_eq!(child.thesis_version_id, *thesis_id);
     assert!(!child.created_by_event_id.is_empty());
-
-    let memory = &replayed.memory_documents[0];
-    assert_eq!(memory.canonical_entity_type, "execution");
-    assert_eq!(
-        memory.canonical_entity_id,
-        replayed.executions[0].execution_id
-    );
-    assert!(!memory.canonical_event_id.is_empty());
 }
 
 #[test]
@@ -183,6 +207,17 @@ fn ui_workspace_hydrates_active_and_historical_runs_from_canonical_state() {
 struct FailingBroker;
 
 impl ports::ExecutionBroker for FailingBroker {
+    fn risk_snapshot(
+        &self,
+        instruments: &[String],
+    ) -> anyhow::Result<Option<ports::BrokerRiskSnapshot>> {
+        Ok(Some(fixture_risk_snapshot(instruments)))
+    }
+
+    fn risk_account_identity(&self) -> Option<ports::BrokerAccountIdentity> {
+        Some(fixture_account_identity())
+    }
+
     fn execute(&self, _request: &domain::TradeRequest) -> anyhow::Result<domain::ExecutionReceipt> {
         anyhow::bail!("broker disconnected")
     }
@@ -221,8 +256,9 @@ fn broker_transport_error_is_canonical_and_does_not_open_a_position() {
     let started = controller
         .start("Test BTCUSD breakout over 4 hours")
         .unwrap();
+    let after_cycle = controller.run_cycle(&started.run_id).unwrap();
     assert!(started.positions.is_empty());
-    assert_eq!(started.loops[0].state, "jev1-broker-rejected");
+    assert_eq!(after_cycle.loops[0].state, "jev1-broker-rejected");
     let replayed = controller.replay(&started.run_id).unwrap();
     assert_eq!(replayed.executions.len(), 1);
     assert_eq!(replayed.executions[0].status, "connection-error");
@@ -234,6 +270,17 @@ struct ReconcilingBroker {
 }
 
 impl ports::ExecutionBroker for ReconcilingBroker {
+    fn risk_snapshot(
+        &self,
+        instruments: &[String],
+    ) -> anyhow::Result<Option<ports::BrokerRiskSnapshot>> {
+        Ok(Some(fixture_risk_snapshot(instruments)))
+    }
+
+    fn risk_account_identity(&self) -> Option<ports::BrokerAccountIdentity> {
+        Some(fixture_account_identity())
+    }
+
     fn execute(&self, request: &domain::TradeRequest) -> anyhow::Result<domain::ExecutionReceipt> {
         Ok(domain::ExecutionReceipt {
             execution_id: uuid::Uuid::new_v4().to_string(),
@@ -248,6 +295,7 @@ impl ports::ExecutionBroker for ReconcilingBroker {
             filled_quantity: request.order.quantity,
             average_price: Some(request.order.reference_price),
             rejection_reason: None,
+            raw_fix_report: None,
             created_by_event_id: request.execution_event_id.clone(),
             executed_at: chrono::Utc::now(),
         })
@@ -301,7 +349,8 @@ fn broker_truth_reconciles_a_local_open_position_without_model_input() {
     let started = controller
         .start("Test BTCUSD breakout over 4 hours")
         .unwrap();
-    assert_eq!(started.positions[0].state, "open");
+    let after_cycle = controller.run_cycle(&started.run_id).unwrap();
+    assert_eq!(after_cycle.positions[0].state, "reconciled-open");
 
     position_exists.store(false, Ordering::SeqCst);
     controller.reconcile_broker(&started.run_id).unwrap();
@@ -320,6 +369,17 @@ struct PartialFillBroker {
 }
 
 impl ports::ExecutionBroker for PartialFillBroker {
+    fn risk_snapshot(
+        &self,
+        instruments: &[String],
+    ) -> anyhow::Result<Option<ports::BrokerRiskSnapshot>> {
+        Ok(Some(fixture_risk_snapshot(instruments)))
+    }
+
+    fn risk_account_identity(&self) -> Option<ports::BrokerAccountIdentity> {
+        Some(fixture_account_identity())
+    }
+
     fn execute(&self, request: &domain::TradeRequest) -> anyhow::Result<domain::ExecutionReceipt> {
         self.execute_count.fetch_add(1, Ordering::SeqCst);
         let filled = request.order.quantity / 2.0;
@@ -343,6 +403,7 @@ impl ports::ExecutionBroker for PartialFillBroker {
             filled_quantity: filled,
             average_price: Some(request.order.reference_price),
             rejection_reason: None,
+            raw_fix_report: None,
             created_by_event_id: request.execution_event_id.clone(),
             executed_at: chrono::Utc::now(),
         })
@@ -370,6 +431,7 @@ impl ports::ExecutionBroker for PartialFillBroker {
             filled_quantity: order.quantity,
             average_price: Some(order.reference_price),
             rejection_reason: None,
+            raw_fix_report: None,
             created_by_event_id: execution_event_id.into(),
             executed_at: chrono::Utc::now(),
         })
@@ -406,8 +468,9 @@ fn partial_fill_uses_confirmed_quantity_and_stop_flattens_broker_risk() {
     let started = controller
         .start("Test BTCUSD breakout over 4 hours")
         .unwrap();
+    controller.run_cycle(&started.run_id).unwrap();
     let replayed = controller.replay(&started.run_id).unwrap();
-    assert_eq!(started.positions[0].state, "open-partial");
+    assert_eq!(replayed.positions[0].state, "open-partial");
     assert_eq!(
         replayed.position_controls[0].quantity,
         replayed.executions[0].filled_quantity
@@ -488,7 +551,11 @@ fn incomplete_snapshot_does_not_mutate_positions() {
     let started = controller
         .start("Test BTCUSD breakout over 4 hours")
         .unwrap();
-    assert_eq!(started.positions[0].state, "open");
+    controller.run_cycle(&started.run_id).unwrap();
+    assert_eq!(
+        controller.run_snapshot(&started.run_id).unwrap().positions[0].state,
+        "open"
+    );
     degraded.store(true, Ordering::SeqCst);
     controller.reconcile_broker(&started.run_id).unwrap();
     let replayed = controller.replay(&started.run_id).unwrap();
@@ -507,6 +574,17 @@ struct DegradingBroker {
 }
 
 impl ports::ExecutionBroker for DegradingBroker {
+    fn risk_snapshot(
+        &self,
+        instruments: &[String],
+    ) -> anyhow::Result<Option<ports::BrokerRiskSnapshot>> {
+        Ok(Some(fixture_risk_snapshot(instruments)))
+    }
+
+    fn risk_account_identity(&self) -> Option<ports::BrokerAccountIdentity> {
+        Some(fixture_account_identity())
+    }
+
     fn execute(&self, request: &domain::TradeRequest) -> anyhow::Result<domain::ExecutionReceipt> {
         let broker_position = domain::BrokerPosition {
             broker_position_id: "degrading-position".into(),
@@ -529,6 +607,7 @@ impl ports::ExecutionBroker for DegradingBroker {
             filled_quantity: request.order.quantity,
             average_price: Some(request.order.reference_price),
             rejection_reason: None,
+            raw_fix_report: None,
             created_by_event_id: request.execution_event_id.clone(),
             executed_at: chrono::Utc::now(),
         })
@@ -586,6 +665,7 @@ fn broker_only_position_is_imported_with_canonical_control() {
     let started = controller
         .start("Test BTCUSD breakout over 4 hours")
         .unwrap();
+    controller.reconcile_broker(&started.run_id).unwrap();
     let replayed = controller.replay(&started.run_id).unwrap();
     assert_eq!(replayed.positions.len(), 1);
     assert_eq!(replayed.positions[0].state, "reconciled-open");
@@ -658,27 +738,21 @@ fn world_model_turns_vague_and_precise_prompts_into_executable_hypotheses() {
         .unwrap();
     assert_eq!(kept.loops.len(), 1);
 
-    let split = controller
+    let split_error = controller
         .review_hypothesis(&HypothesisReviewRequest {
             run_id: precise.run_id.clone(),
             hypothesis_id: precise.hypotheses[0].id.clone(),
             evidence_query: "evidence supports a competing timeframe; split".into(),
         })
-        .unwrap();
-    assert_eq!(
-        split
-            .loops
-            .iter()
-            .filter(|item| item.state != "stopped")
-            .count(),
-        2
+        .unwrap_err();
+    assert!(
+        format!("{split_error:#}").contains("two distinct trusted supporting canonical records")
     );
 
-    let child_id = split.hypotheses.last().unwrap().id.clone();
     let modified = controller
         .review_hypothesis(&HypothesisReviewRequest {
             run_id: precise.run_id.clone(),
-            hypothesis_id: child_id,
+            hypothesis_id: precise.hypotheses[0].id.clone(),
             evidence_query: "modify to a different timeframe".into(),
         })
         .unwrap();
@@ -688,7 +762,7 @@ fn world_model_turns_vague_and_precise_prompts_into_executable_hypotheses() {
             .iter()
             .filter(|item| item.state != "stopped")
             .count(),
-        2
+        1
     );
 
     let latest_id = modified.hypotheses.last().unwrap().id.clone();
@@ -705,7 +779,7 @@ fn world_model_turns_vague_and_precise_prompts_into_executable_hypotheses() {
             .iter()
             .filter(|item| item.state != "stopped")
             .count(),
-        1
+        0
     );
     assert!(stopped
         .loops
@@ -719,11 +793,8 @@ fn world_model_turns_vague_and_precise_prompts_into_executable_hypotheses() {
         .all(|item| item.allocated_fraction == 1.0));
 
     let replayed = controller.replay(&precise.run_id).unwrap();
-    assert_eq!(replayed.hypothesis_reviews.len(), 4);
-    assert!(replayed
-        .hypotheses
-        .iter()
-        .any(|item| item.status == "stopped"));
+    assert_eq!(replayed.hypothesis_reviews.len(), 3);
+    assert!(replayed.loops.iter().all(|item| item.state == "stopped"));
     let latest_allocation = replayed.capital_allocations.last().unwrap();
     assert_eq!(
         latest_allocation
@@ -731,7 +802,7 @@ fn world_model_turns_vague_and_precise_prompts_into_executable_hypotheses() {
             .iter()
             .map(|entry| entry.fraction)
             .sum::<f64>(),
-        1.0
+        0.0
     );
     assert_eq!(
         latest_allocation
@@ -813,6 +884,8 @@ fn continuous_loop_routes_buy_more_through_jev1_and_sell_back_to_jev1() {
         Box::new(jev),
     );
     let started = controller.start("BTC continuation over 1 hour").unwrap();
+    controller.run_cycle(&started.run_id).unwrap();
+    controller.run_cycle(&started.run_id).unwrap();
     let after_buy_more = controller.run_cycle(&started.run_id).unwrap();
     assert_eq!(after_buy_more.loops[0].state, "jev1-confirm-add");
     let after_confirmation = controller.run_cycle(&started.run_id).unwrap();
@@ -860,6 +933,7 @@ fn immutable_canonical_events_reject_rewrite_and_delete() {
     let store = CanonicalStore::open(directory.path()).unwrap();
     let mut controller = HarnessController::new(store, 0.0);
     let active = controller.start("BTC continuation").unwrap();
+    controller.run_cycle(&active.run_id).unwrap();
 
     let connection = Connection::open(database_path).unwrap();
     let update = connection.execute(
@@ -880,6 +954,7 @@ fn search_memory_exposes_exact_canonical_reference() {
     let store = CanonicalStore::open(directory.path()).unwrap();
     let mut controller = HarnessController::new(store, 0.0);
     let active = controller.start("BTC continuation").unwrap();
+    controller.run_cycle(&active.run_id).unwrap();
     let replayed = controller.replay(&active.run_id).unwrap();
 
     let hits = controller.search("caused execution").unwrap();
@@ -923,6 +998,7 @@ fn qdrant_context_pool_supports_harvey_retrieval_and_automatic_logs() {
     let active = controller
         .start("Compare BTC continuation after a directional pullback")
         .unwrap();
+    controller.run_cycle(&active.run_id).unwrap();
     controller
         .ingest_context(&ContextIngestRequest {
             run_id: active.run_id.clone(),
@@ -937,16 +1013,16 @@ fn qdrant_context_pool_supports_harvey_retrieval_and_automatic_logs() {
         })
         .unwrap();
     let replayed = controller.replay(&active.run_id).unwrap();
-    assert_eq!(replayed.context_pool_records.len(), 4);
+    assert_eq!(replayed.context_pool_records.len(), 1);
 
-    let review_event = store
-        .stored_events(&active.run_id)
-        .unwrap()
-        .into_iter()
-        .find(|stored| stored.event.kind == "startup_memory_review_recorded")
+    let review_package = controller
+        .assemble_review_package(&HypothesisReviewRequest {
+            run_id: active.run_id.clone(),
+            hypothesis_id: active.hypotheses[0].id.clone(),
+            evidence_query: "prior directional pullback continuation experiments".into(),
+        })
         .unwrap();
-    let world_trace: RetrievalTrace =
-        serde_json::from_value(review_event.event.payload["retrievalTrace"].clone()).unwrap();
+    let world_trace: RetrievalTrace = review_package.historical_retrieval.unwrap();
     assert!(world_trace.sufficient);
     assert!(world_trace.steps.iter().any(|step| step.action == "search"));
     assert!(world_trace
@@ -957,19 +1033,14 @@ fn qdrant_context_pool_supports_harvey_retrieval_and_automatic_logs() {
         .steps
         .iter()
         .any(|step| step.action == "decide_sufficiency"));
-
-    let source_classes: HashSet<&str> = world_trace
+    assert!(world_trace
         .hits
         .iter()
-        .map(|hit| hit.source_class.as_str())
-        .collect();
-    assert!(source_classes.contains("live_official"));
-    assert!(source_classes.contains("historical_recorded"));
-    assert!(source_classes.contains("external_web_research"));
-    assert!(source_classes.contains("internal_canonical"));
-    assert!(world_trace.hits.iter().any(|hit| {
-        hit.source_class == "external_web_research" && hit.trust_level == "untrusted"
-    }));
+        .any(|hit| hit.source_class == "historical_recorded"));
+    assert!(world_trace
+        .hits
+        .iter()
+        .any(|hit| hit.source_class == "internal_canonical"));
 
     let execution_id = replayed.executions[0].execution_id.clone();
     let exact_and_semantic = controller
@@ -1001,6 +1072,7 @@ fn qdrant_context_pool_supports_harvey_retrieval_and_automatic_logs() {
     let comparison = controller
         .start("Test BTCUSD continuation over 1 hour in a different volatility context")
         .unwrap();
+    controller.run_cycle(&comparison.run_id).unwrap();
     controller
         .review_hypothesis(&HypothesisReviewRequest {
             run_id: comparison.run_id.clone(),

@@ -23,6 +23,7 @@ pub struct ConnectorSettings {
     pub world_model_adapter: String,
     pub jev_adapter: String,
     pub broker_adapter: String,
+    pub risk_readiness: String,
     pub sections: Vec<ConnectorSection>,
     pub restart_required: bool,
 }
@@ -240,7 +241,7 @@ const CONNECTOR_FIELDS: &[(&str, &str, &str, bool, bool, &str)] = &[
         "MCP endpoint",
         false,
         false,
-        "http://127.0.0.1:…",
+        "Defaults to http://127.0.0.1:9876/mcp/",
     ),
     (
         "ctrader-mcp",
@@ -252,83 +253,51 @@ const CONNECTOR_FIELDS: &[(&str, &str, &str, bool, bool, &str)] = &[
     ),
     (
         "ctrader-mcp",
-        "CTRADER_MCP_AUTH_TOKEN",
-        "MCP auth token",
-        true,
+        "CTRADER_MCP_ENVIRONMENT",
+        "Account environment",
         false,
-        "Enter auth token",
+        false,
+        "demo or live",
     ),
     (
-        "ctrader-open-api",
-        "CTRADER_OPEN_API_ENVIRONMENT",
-        "Environment",
-        false,
+        "twelve-data",
+        "TWELVE_DATA_API_KEY",
+        "Twelve Data API key",
         true,
-        "demo",
+        false,
+        "Optional for price-only FIX strategies",
     ),
     (
-        "ctrader-open-api",
-        "CTRADER_OPEN_API_CLIENT_ID",
-        "Open API client ID",
+        "twelve-data",
+        "TWELVE_DATA_SYMBOL_MAP",
+        "Broker → provider symbols",
         false,
-        true,
-        "Application client ID",
+        false,
+        "BTCUSD:BTC/USD,EURUSD:EUR/USD",
     ),
     (
-        "ctrader-open-api",
-        "CTRADER_OPEN_API_CLIENT_SECRET",
-        "Open API client secret",
-        true,
-        true,
-        "Application client secret",
+        "twelve-data",
+        "TWELVE_DATA_HISTORY_DEPTH",
+        "1m history depth",
+        false,
+        false,
+        "250",
     ),
     (
-        "ctrader-open-api",
-        "CTRADER_OPEN_API_ACCESS_TOKEN",
-        "Read-only access token",
-        true,
-        true,
-        "OAuth access token",
+        "twelve-data",
+        "TWELVE_DATA_REST_INTERVAL_SECONDS",
+        "REST confirmation interval",
+        false,
+        false,
+        "65",
     ),
     (
-        "ctrader-open-api",
-        "CTRADER_OPEN_API_REFRESH_TOKEN",
-        "Refresh token",
-        true,
-        false,
-        "Optional OAuth refresh token",
-    ),
-    (
-        "ctrader-open-api",
-        "CTRADER_OPEN_API_ACCOUNT_ID",
-        "Account ID",
-        false,
-        true,
-        "cTID trader account ID",
-    ),
-    (
-        "ctrader-open-api",
-        "CTRADER_OPEN_API_SYMBOL_MAP",
-        "Symbol map",
-        false,
-        true,
-        "BTCUSD:OPEN_API_SYMBOL_ID",
-    ),
-    (
-        "ctrader-open-api",
-        "CTRADER_OPEN_API_PORT",
-        "TLS port",
+        "twelve-data",
+        "MARKET_PRICE_DIVERGENCE_LIMITS",
+        "Per-symbol price divergence limits",
         false,
         false,
-        "5035",
-    ),
-    (
-        "ctrader-open-api",
-        "CTRADER_OPEN_API_TIMEOUT_SECONDS",
-        "Request timeout seconds",
-        false,
-        false,
-        "15",
+        "US100:0.005",
     ),
     (
         "ctrader-open-api",
@@ -345,6 +314,22 @@ const CONNECTOR_FIELDS: &[(&str, &str, &str, bool, bool, &str)] = &[
         false,
         false,
         "250",
+    ),
+    (
+        "fix-common",
+        "CTRADER_FIX_MCP_VOLUME_SCALE",
+        "FIX quantity per MCP volume unit",
+        false,
+        true,
+        "BTCUSD:<broker-confirmed factor>",
+    ),
+    (
+        "fix-common",
+        "CTRADER_FIX_DEMO_FIXED_QUANTITY_MAP",
+        "Fixed entry quantity for Demo symbols",
+        false,
+        false,
+        "BTCUSD:0.01",
     ),
     (
         "fix-common",
@@ -538,46 +523,65 @@ impl HarnessConfig {
         {
             bail!("unsupported adapter selection in harness.json");
         }
+        // Paper currency is only used to size simulated orders. Requiring it
+        // to be valid during a live FIX startup makes an unused paper setting
+        // an unrelated app-start blocker.
+        if config.broker_adapter == "simulated" {
+            let paper_currency = config.risk_policy.paper_account_currency.trim();
+            if !crate::risk::is_supported_currency_code(paper_currency) {
+                bail!(
+                    "riskPolicy.paperAccountCurrency must be a supported fiat or crypto currency code"
+                );
+            }
+            config.risk_policy.paper_account_currency = paper_currency.to_ascii_uppercase();
+        }
         let values = env_file_values(project_root)?;
-        let parse = |key: &str| values.get(key).map(String::as_str);
+        let parse = |key: &str| {
+            values
+                .get(key)
+                .map(String::as_str)
+                .filter(|value| !value.trim().is_empty())
+        };
         if let Some(value) = parse("AUTONOMOUS_REVIEW_ENABLED") {
             config.autonomous_review.enabled = value.eq_ignore_ascii_case("true");
         }
-        if let Some(value) = parse("REVIEW_NO_TRADE_HORIZON_MODE") {
-            config.autonomous_review.no_trade_horizon_mode = value.to_owned();
-        }
-        macro_rules! parse_number {
-            ($key:literal, $field:ident) => {
-                if let Some(value) = parse($key) {
-                    config.autonomous_review.$field =
-                        value.parse().with_context(|| format!("invalid {}", $key))?;
-                }
-            };
-        }
-        parse_number!("REVIEW_NO_TRADE_MIN_DECISIONS", no_trade_min_decisions);
-        parse_number!("REVIEW_NO_TRADE_MAX_DECISIONS", no_trade_max_decisions);
-        parse_number!("REVIEW_CONSECUTIVE_LOSSES", consecutive_loss_threshold);
-        parse_number!("REVIEW_PERIODIC_TRADES", periodic_trade_threshold);
-        parse_number!("REVIEW_MAX_ACTIVE_LOOPS", max_active_loops);
-        parse_number!("REVIEW_SPLIT_CONFIDENCE", split_confidence_threshold);
-        parse_number!("REVIEW_RETRY_ATTEMPTS", retry_attempts);
-        parse_number!("REVIEW_RETRY_BASE_SECONDS", retry_base_seconds);
-        if config.autonomous_review.no_trade_min_decisions == 0
-            || config.autonomous_review.no_trade_min_decisions
-                > config.autonomous_review.no_trade_max_decisions
-            || config.autonomous_review.consecutive_loss_threshold == 0
-            || config.autonomous_review.periodic_trade_threshold == 0
-            || config.autonomous_review.max_active_loops == 0
-            || !(0.0..=1.0).contains(&config.autonomous_review.split_confidence_threshold)
-            || config.autonomous_review.retry_attempts == 0
-        {
-            bail!("invalid autonomous review policy");
-        }
-        if !matches!(
-            config.autonomous_review.no_trade_horizon_mode.as_str(),
-            "hypothesis_horizon" | "fixed_minimum"
-        ) {
-            bail!("unsupported REVIEW_NO_TRADE_HORIZON_MODE");
+        if config.autonomous_review.enabled {
+            if let Some(value) = parse("REVIEW_NO_TRADE_HORIZON_MODE") {
+                config.autonomous_review.no_trade_horizon_mode = value.to_owned();
+            }
+            macro_rules! parse_number {
+                ($key:literal, $field:ident) => {
+                    if let Some(value) = parse($key) {
+                        config.autonomous_review.$field =
+                            value.parse().with_context(|| format!("invalid {}", $key))?;
+                    }
+                };
+            }
+            parse_number!("REVIEW_NO_TRADE_MIN_DECISIONS", no_trade_min_decisions);
+            parse_number!("REVIEW_NO_TRADE_MAX_DECISIONS", no_trade_max_decisions);
+            parse_number!("REVIEW_CONSECUTIVE_LOSSES", consecutive_loss_threshold);
+            parse_number!("REVIEW_PERIODIC_TRADES", periodic_trade_threshold);
+            parse_number!("REVIEW_MAX_ACTIVE_LOOPS", max_active_loops);
+            parse_number!("REVIEW_SPLIT_CONFIDENCE", split_confidence_threshold);
+            parse_number!("REVIEW_RETRY_ATTEMPTS", retry_attempts);
+            parse_number!("REVIEW_RETRY_BASE_SECONDS", retry_base_seconds);
+            if config.autonomous_review.no_trade_min_decisions == 0
+                || config.autonomous_review.no_trade_min_decisions
+                    > config.autonomous_review.no_trade_max_decisions
+                || config.autonomous_review.consecutive_loss_threshold == 0
+                || config.autonomous_review.periodic_trade_threshold == 0
+                || config.autonomous_review.max_active_loops == 0
+                || !(0.0..=1.0).contains(&config.autonomous_review.split_confidence_threshold)
+                || config.autonomous_review.retry_attempts == 0
+            {
+                bail!("invalid autonomous review policy");
+            }
+            if !matches!(
+                config.autonomous_review.no_trade_horizon_mode.as_str(),
+                "hypothesis_horizon" | "fixed_minimum"
+            ) {
+                bail!("unsupported REVIEW_NO_TRADE_HORIZON_MODE");
+            }
         }
         Ok(config)
     }
@@ -600,20 +604,28 @@ impl HarnessConfig {
     }
 }
 
-fn env_file_values(project_root: &Path) -> Result<HashMap<String, String>> {
+pub(crate) fn env_file_values(project_root: &Path) -> Result<HashMap<String, String>> {
     let path = project_root.join(".env");
-    let contents = fs::read_to_string(&path).unwrap_or_default();
-    Ok(contents
-        .lines()
-        .filter_map(|line| {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                return None;
-            }
-            line.split_once('=')
-                .map(|(key, value)| (key.trim().to_owned(), value.trim().to_owned()))
-        })
-        .collect())
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+    Ok(dotenvy::from_path_iter(path)?.collect::<Result<HashMap<_, _>, _>>()?)
+}
+
+fn encode_dotenv_value(value: &str) -> Result<String> {
+    if value.contains(['\r', '\n']) {
+        bail!("connector settings cannot contain line breaks");
+    }
+    let mut encoded = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '\\' => encoded.push_str("\\\\"),
+            '"' => encoded.push_str("\\\""),
+            '$' => encoded.push_str("\\$"),
+            other => encoded.push(other),
+        }
+    }
+    Ok(format!("\"{encoded}\""))
 }
 
 fn usable(value: Option<&String>) -> bool {
@@ -655,17 +667,17 @@ pub fn load_connector_settings(project_root: &Path) -> Result<ConnectorSettings>
         (
             "ctrader-mcp",
             "cTrader MCP",
-            "Read-only cTrader data available to research and context.",
+            "Read-only broker research and symbol metadata. Local MCP authenticates through the active cTrader Desktop session; no bearer token is used.",
         ),
         (
-            "ctrader-open-api",
-            "cTrader Open API market history",
-            "Read-only completed trendbars used to seed and repair deterministic live Jev context.",
+            "twelve-data",
+            "Twelve Data market history",
+            "Optional REST-confirmed candles and WebSocket prices; FIX remains execution truth.",
         ),
         (
             "fix-common",
             "FIX execution",
-            "Shared deterministic FIX execution settings.",
+            "Shared FIX settings. Demo symbols with an explicit fixed quantity use that bounded unit when account-risk data is unavailable; live entries still require a fresh risk snapshot.",
         ),
         (
             "fix-price",
@@ -675,7 +687,7 @@ pub fn load_connector_settings(project_root: &Path) -> Result<ConnectorSettings>
         (
             "fix-trade",
             "FIX trade session",
-            "Order and position connection used by the harness.",
+            "Order and position connection used by the harness. One-cycle manual verification is available when live account or volume metadata cannot be fetched.",
         ),
     ]
     .into_iter()
@@ -687,7 +699,11 @@ pub fn load_connector_settings(project_root: &Path) -> Result<ConnectorSettings>
             .iter()
             .filter(|field| field.0 == id)
             .map(|(_, key, label, secret, required, placeholder)| {
-                let configured = usable(values.get(*key));
+                let configured = if *key == "CTRADER_MCP_ENABLED" {
+                    values.get(*key).is_some_and(|value| value.eq_ignore_ascii_case("true"))
+                } else {
+                    usable(values.get(*key))
+                };
                 ConnectorField {
                     key: (*key).to_owned(),
                     label: (*label).to_owned(),
@@ -713,10 +729,17 @@ pub fn load_connector_settings(project_root: &Path) -> Result<ConnectorSettings>
             .collect(),
     })
     .collect();
+    let risk_readiness = if config.broker_adapter == "simulated" {
+        "Simulated execution uses the configured paper risk policy. No cTrader account is used."
+            .into()
+    } else {
+        "Automatic account risk snapshots are unavailable. Select an active run and use the human verification panel to enter current cTrader account values and symbol limits for one decision cycle; otherwise no live entry is submitted.".into()
+    };
     Ok(ConnectorSettings {
         world_model_adapter: config.world_model_adapter,
         jev_adapter: config.jev_adapter,
         broker_adapter: config.broker_adapter,
+        risk_readiness,
         sections,
         restart_required: false,
     })
@@ -746,12 +769,29 @@ pub fn save_connector_settings(
 
     let env_path = project_root.join(".env");
     let existing = fs::read_to_string(&env_path).unwrap_or_default();
+    let saved_values = env_file_values(project_root)?;
     let mut pending = update.values;
     let secret_keys: std::collections::HashSet<&str> = CONNECTOR_FIELDS
         .iter()
         .filter(|field| field.3)
         .map(|field| field.1)
         .collect();
+    // Secret inputs are intentionally blank in the UI until a user replaces
+    // them. Preserve the effective dotenv value and normalize duplicate keys
+    // to one definition so the UI and runtime cannot select different values.
+    let blank_secrets: Vec<String> = pending
+        .iter()
+        .filter(|(key, value)| secret_keys.contains(key.as_str()) && value.trim().is_empty())
+        .map(|(key, _)| key.clone())
+        .collect();
+    for key in blank_secrets {
+        if let Some(value) = saved_values.get(&key) {
+            pending.insert(key, value.clone());
+        } else {
+            pending.remove(&key);
+        }
+    }
+    let keys_to_write: std::collections::HashSet<String> = pending.keys().cloned().collect();
     let mut output = Vec::new();
     for line in existing.lines() {
         let Some((raw_key, _)) = line.split_once('=') else {
@@ -759,20 +799,17 @@ pub fn save_connector_settings(
             continue;
         };
         let key = raw_key.trim();
-        if let Some(value) = pending.remove(key) {
-            if secret_keys.contains(key) && value.trim().is_empty() {
-                output.push(line.to_owned());
-            } else {
-                output.push(format!("{key}={}", value.trim()));
-            }
-        } else {
+        if !keys_to_write.contains(key) {
             output.push(line.to_owned());
         }
     }
+    let mut pending: Vec<_> = pending.into_iter().collect();
+    pending.sort_by(|left, right| left.0.cmp(&right.0));
     for (key, value) in pending {
-        if !(secret_keys.contains(key.as_str()) && value.trim().is_empty()) {
-            output.push(format!("{key}={}", value.trim()));
+        if secret_keys.contains(key.as_str()) && value.trim().is_empty() {
+            continue;
         }
+        output.push(format!("{key}={}", encode_dotenv_value(value.trim())?));
     }
     fs::write(&env_path, format!("{}\n", output.join("\n")))?;
 
@@ -790,4 +827,100 @@ pub fn save_connector_settings(
     let mut settings = load_connector_settings(project_root)?;
     settings.restart_required = true;
     Ok(settings)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dotenv_serializer_round_trips_secret_characters() {
+        let expected = r#"token with spaces # 'quotes' $HOME \path"#;
+        let file = tempfile::NamedTempFile::new().unwrap();
+        fs::write(
+            file.path(),
+            format!(
+                "TEST_CONNECTOR_SECRET={}\n",
+                encode_dotenv_value(expected).unwrap()
+            ),
+        )
+        .unwrap();
+        let parsed = dotenvy::from_path_iter(file.path())
+            .unwrap()
+            .collect::<Result<HashMap<_, _>, _>>()
+            .unwrap();
+        assert_eq!(parsed.get("TEST_CONNECTOR_SECRET").unwrap(), expected);
+    }
+
+    #[test]
+    fn saving_settings_keeps_the_saved_secret_and_removes_duplicate_definitions() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir_all(directory.path().join("config")).unwrap();
+        fs::write(
+            directory.path().join("config/harness.json"),
+            include_str!("../../config/harness.json"),
+        )
+        .unwrap();
+        let secret = r#"saved # secret $HOME \ path"#;
+        fs::write(
+            directory.path().join(".env"),
+            format!(
+                "CTRADER_MCP_ENDPOINT=http://old.invalid/mcp/\nCTRADER_MCP_ENDPOINT=http://current.invalid/mcp/\nCTRADER_MCP_AUTH_TOKEN={}\nKEEP_THIS=value\n",
+                encode_dotenv_value(secret).unwrap()
+            ),
+        )
+        .unwrap();
+
+        save_connector_settings(
+            directory.path(),
+            ConnectorSettingsUpdate {
+                world_model_adapter: "openrouter".into(),
+                jev_adapter: "typesafe".into(),
+                broker_adapter: "ctrader-fix".into(),
+                values: HashMap::from([
+                    (
+                        "CTRADER_MCP_ENDPOINT".into(),
+                        "http://updated.invalid/mcp/".into(),
+                    ),
+                    ("CTRADER_MCP_AUTH_TOKEN".into(), String::new()),
+                ]),
+            },
+        )
+        .unwrap();
+
+        let parsed = env_file_values(directory.path()).unwrap();
+        assert_eq!(
+            parsed.get("CTRADER_MCP_ENDPOINT").unwrap(),
+            "http://updated.invalid/mcp/"
+        );
+        assert_eq!(parsed.get("CTRADER_MCP_AUTH_TOKEN").unwrap(), secret);
+        assert_eq!(parsed.get("KEEP_THIS").unwrap(), "value");
+        let file = fs::read_to_string(directory.path().join(".env")).unwrap();
+        assert_eq!(
+            file.lines()
+                .filter(|line| line.starts_with("CTRADER_MCP_ENDPOINT="))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn invalid_review_overrides_do_not_block_startup_when_reviews_are_disabled() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir_all(directory.path().join("config")).unwrap();
+        fs::write(
+            directory.path().join("config/harness.json"),
+            include_str!("../../config/harness.json"),
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join(".env"),
+            "AUTONOMOUS_REVIEW_ENABLED=false\nREVIEW_MAX_ACTIVE_LOOPS=not-a-number\nREVIEW_NO_TRADE_HORIZON_MODE=invalid\n",
+        )
+        .unwrap();
+
+        let config = HarnessConfig::load(directory.path()).unwrap();
+
+        assert!(!config.autonomous_review.enabled);
+    }
 }

@@ -57,6 +57,9 @@ impl ExecutionBroker for UnavailableBroker {
     fn reference_price(&self, _: &str) -> Result<Option<f64>> {
         bail!(self.0.clone())
     }
+    fn supports_instrument(&self, _: &str) -> Result<bool> {
+        Ok(false)
+    }
     fn reconcile(&self) -> Result<BrokerSnapshot> {
         bail!(self.0.clone())
     }
@@ -71,96 +74,9 @@ impl WorldModel for SimulatedWorldModel {
         human_thesis: &str,
         retriever: Option<&dyn ContextRetriever>,
     ) -> Result<WorldModelStartupOutput> {
-        let _system_prompt = WORLD_MODEL_SYSTEM_PROMPT;
-        let now = Utc::now();
-        let definition_id = Uuid::new_v4().to_string();
         let instruments = infer_instruments(human_thesis);
         let mechanism = infer_mechanism(human_thesis);
         let timeframe = infer_timeframe(human_thesis);
-        let thesis = ThesisVersion {
-            id: Uuid::new_v4().to_string(),
-            run_id: run_id.to_owned(),
-            version: 1,
-            thesis: format!(
-                "Test whether {} on {} produces directional continuation over {}.",
-                mechanism,
-                instruments.join(", "),
-                timeframe.label
-            ),
-            provenance: "world-model interpretation of human input".into(),
-            created_by_event_id: Uuid::new_v4().to_string(),
-            created_at: now,
-        };
-        let context_definition = ContextDefinition {
-            id: definition_id.clone(),
-            run_id: run_id.to_owned(),
-            name: "world-model-selected-market-context".into(),
-            description: format!(
-                "Deterministic observations for {} using {}.",
-                instruments.join(", "),
-                mechanism
-            ),
-            created_by_event_id: Uuid::new_v4().to_string(),
-            created_at: now,
-        };
-        let context = ContextVersion {
-                id: Uuid::new_v4().to_string(),
-                definition_id,
-                run_id: run_id.to_owned(),
-                version: 1,
-                items: vec![ContextItem {
-                    source: "system://world-model/context-selection".into(),
-                    source_id: "deterministic-context-v1".into(),
-                    observed_at: now,
-                    content: format!(
-                        "Instrument={}, mechanism={}, timeframe={}; observe price structure, volume and volatility regime.",
-                        instruments.join(","), mechanism, timeframe.label
-                    ),
-                }],
-                created_by_event_id: Uuid::new_v4().to_string(),
-                created_at: now,
-            };
-        let hypothesis_id = Uuid::new_v4().to_string();
-        let hypothesis = HypothesisDefinition {
-            id: hypothesis_id.clone(),
-            root_hypothesis_id: hypothesis_id,
-            run_id: run_id.to_owned(),
-            version: 1,
-            parent_hypothesis_id: None,
-            original_prompt: human_thesis.to_owned(),
-            instruments: instruments.clone(),
-            strategy_mechanism: mechanism.clone(),
-            timeframe: timeframe.clone(),
-            deterministic_context: vec![
-                "price structure".into(),
-                "volume".into(),
-                "volatility regime".into(),
-            ],
-            live_context_spec: Some(crate::market_data::default_live_context_spec(
-                instruments.first().map(String::as_str).unwrap_or("BTCUSD"),
-            )),
-            jev_question: format!(
-                "Does current evidence support entering {} for the {} hypothesis over {}?",
-                instruments.join(", "),
-                mechanism,
-                timeframe.label
-            ),
-            review_rules: HypothesisReviewRules {
-                support_evidence: vec!["directional follow-through with confirming volume".into()],
-                weaken_evidence: vec!["repeated signal failure or regime mismatch".into()],
-                invalidate_evidence: vec!["mechanism fails across the defined review window".into()],
-                modify_when: vec!["evidence supports the mechanism at a different horizon".into()],
-                split_when: vec![
-                    "credible evidence supports a competing mechanism or timeframe".into(),
-                ],
-                stop_when: vec!["invalidation evidence persists without a viable revision".into()],
-            },
-            thesis_version_id: thesis.id.clone(),
-            context_version_id: context.id.clone(),
-            status: "active".into(),
-            created_by_event_id: Uuid::new_v4().to_string(),
-            created_at: now,
-        };
         let lower = human_thesis.to_ascii_lowercase();
         let requires_grounding = ["current", "latest", "today", "news", "live", "official"]
             .iter()
@@ -183,12 +99,72 @@ impl WorldModel for SimulatedWorldModel {
         } else {
             None
         };
+        let live_context_spec = crate::market_data::default_live_context_spec(
+            instruments.first().map(String::as_str).unwrap_or("BTCUSD"),
+        );
+        let explicit_stop_limits = crate::contracts::explicit_user_stop_limits(human_thesis)?;
+        let skill_invocations = vec![crate::contracts::SkillInvocation {
+            skill_id: "loop.lifecycle_limits".into(),
+            arguments: serde_json::json!({
+                "maximumElapsedSeconds":explicit_stop_limits.maximum_elapsed_seconds,
+                "maximumCompletedTrades":explicit_stop_limits.maximum_completed_trades,
+                "noTradeDecisions":12,
+                "consecutiveLosses":3,
+                "completedTrades":10
+            }),
+        }];
+        let evidence_ids = retrieval_trace
+            .as_ref()
+            .map(|trace| {
+                trace
+                    .hits
+                    .iter()
+                    .map(|hit| hit.canonical_entity_id.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut contract_draft = crate::contracts::HypothesisContractDraft {
+            user_objective: human_thesis.into(),
+            thesis: format!(
+                "Test whether {} on {} produces directional continuation over {}.",
+                mechanism,
+                instruments.join(", "),
+                timeframe.label
+            ),
+            instruments: instruments.clone(),
+            mechanism: mechanism.clone(),
+            expected_behavior: format!("Directional continuation consistent with {mechanism} over {}.", timeframe.label),
+            timeframe: timeframe.clone(),
+            expires_at: None,
+            supporting_evidence_ids: evidence_ids,
+            contradictory_evidence_ids: Vec::new(),
+            key_assumptions: vec!["The selected instrument remains tradable and live context stays fresh.".into()],
+            alternative_explanation: "Observed movement may be noise or a different market regime.".into(),
+            context_requirements: crate::contracts::context_requirements_from_live_spec(&live_context_spec)?,
+            live_context_spec,
+            invalidation_conditions: vec!["The selected mechanism is contradicted by the resolved live evidence.".into()],
+            review_triggers: crate::contracts::ContractReviewTriggers {
+                no_trade_decisions: 0,
+                consecutive_losses: 0,
+                completed_trades: 0,
+            },
+            stop_limits: crate::contracts::ContractStopLimits::default(),
+            jev1_objective: format!(
+                "Does current evidence support entering {} for the {} hypothesis over {}?",
+                instruments.join(", "),
+                mechanism,
+                timeframe.label
+            ),
+            jev2_objective: "Manage the open position using current live context; hold, close, or request separate Jev1 confirmation to add exposure.".into(),
+            skill_invocations: skill_invocations.clone(),
+        };
+        crate::skills::SkillRegistry::discover_builtin()
+            .normalize_and_apply_contract_against_objective(&mut contract_draft, human_thesis)?;
         Ok(WorldModelStartupOutput {
-            thesis,
-            context_definition,
-            context,
-            hypothesis,
+            contract: contract_draft,
             retrieval_trace,
+            web_research_unavailable: false,
+            broker_context_unavailable: None,
         })
     }
 
@@ -215,6 +191,7 @@ impl WorldModel for SimulatedWorldModel {
             } else {
                 HypothesisAction::Keep
             };
+        let split_requires_escalation = action == HypothesisAction::Split;
         let proposed_timeframe =
             matches!(action, HypothesisAction::Modify | HypothesisAction::Split).then(|| {
                 TimeframeDefinition {
@@ -248,6 +225,35 @@ impl WorldModel for SimulatedWorldModel {
                 rationale: "Historical evidence warrants a competing test candidate.".into(),
                 competing_with_hypothesis_id: hypothesis.id.clone(),
             });
+        let proposed_contract =
+            matches!(action, HypothesisAction::Modify | HypothesisAction::Split)
+                .then(|| {
+                    let mut proposal = hypothesis.contract.as_ref()?.proposal.clone();
+                    let mechanism = if action == HypothesisAction::Split {
+                        format!("competing {}", hypothesis.strategy_mechanism)
+                    } else {
+                        hypothesis.strategy_mechanism.clone()
+                    };
+                    proposal.mechanism = mechanism.clone();
+                    if let Some(timeframe) = &proposed_timeframe {
+                        proposal.timeframe = timeframe.clone();
+                    }
+                    proposal.thesis = format!(
+                        "Test whether {mechanism} on {} produces directional continuation over {}.",
+                        proposal.instruments.join(", "),
+                        proposal.timeframe.label
+                    );
+                    proposal.expected_behavior = format!(
+                        "Directional continuation consistent with {mechanism} over {}.",
+                        proposal.timeframe.label
+                    );
+                    proposal.jev1_objective = format!(
+                        "Does current evidence support the {mechanism} hypothesis over {}?",
+                        proposal.timeframe.label
+                    );
+                    Some(proposal)
+                })
+                .flatten();
         Ok(HypothesisReviewDecision {
             id: Uuid::new_v4().to_string(),
             run_id: hypothesis.run_id.clone(),
@@ -267,12 +273,17 @@ impl WorldModel for SimulatedWorldModel {
                 .then(|| format!("competing {}", hypothesis.strategy_mechanism)),
             proposed_timeframe,
             candidate_hypothesis,
+            proposed_contract,
             routing: Some(WorldModelRoutingMetadata {
                 provider: "simulated".into(),
                 base_model: "simulated".into(),
                 selected_model: "simulated".into(),
-                escalated: false,
-                escalation_reasons: Vec::new(),
+                escalated: split_requires_escalation,
+                escalation_reasons: if split_requires_escalation {
+                    vec!["split_requires_escalation".into()]
+                } else {
+                    Vec::new()
+                },
                 base_confidence: 1.0,
                 request_ids: Vec::new(),
                 internet_research_used: false,
@@ -310,14 +321,18 @@ fn infer_instruments(prompt: &str) -> Vec<String> {
         .split(|character: char| !character.is_ascii_alphanumeric())
         .filter(|token| !token.is_empty())
         .collect();
-    let known = [
-        "BTCUSD", "ETHUSD", "EURUSD", "GBPUSD", "BTC", "ETH", "TSLA", "AAPL", "ES",
-    ];
+    let known = ["BTCUSD", "ETHUSD", "EURUSD", "GBPUSD", "TSLA", "AAPL", "ES"];
     let mut found: Vec<String> = known
         .iter()
         .filter(|symbol| tokens.iter().any(|token| token == *symbol))
         .map(|symbol| (*symbol).to_owned())
         .collect();
+    if found.is_empty() && tokens.iter().any(|token| *token == "BTC") {
+        found.push("BTCUSD".into());
+    }
+    if found.is_empty() && tokens.iter().any(|token| *token == "ETH") {
+        found.push("ETHUSD".into());
+    }
     if found.is_empty() {
         found.push("BTCUSD".into());
     }
@@ -394,12 +409,7 @@ impl JevEngine for SimulatedJev {
                 returned_model: "simulated-jev".into(),
                 question_id: "entry_action".into(),
                 answer_type: "choice".into(),
-                probabilities: [
-                    ("LONG".into(), 0.82),
-                    ("SHORT".into(), 0.08),
-                    ("NO TRADE".into(), 0.10),
-                ]
-                .into(),
+                probabilities: [("LONG".into(), 0.91), ("SHORT".into(), 0.09)].into(),
                 usage: JevUsage::default(),
                 request_id: None,
             },
@@ -433,6 +443,10 @@ impl JevEngine for SimulatedJev {
 pub struct SimulatedBroker;
 
 impl ExecutionBroker for SimulatedBroker {
+    fn allows_static_risk_policy(&self) -> bool {
+        true
+    }
+
     fn execute(&self, request: &TradeRequest) -> Result<ExecutionReceipt> {
         if request.order.status != "approved"
             || request.order.run_id != request.run_id
@@ -460,6 +474,7 @@ impl ExecutionBroker for SimulatedBroker {
             filled_quantity: request.order.quantity,
             average_price: Some(request.order.reference_price),
             rejection_reason: None,
+            raw_fix_report: None,
             created_by_event_id: request.execution_event_id.clone(),
             executed_at: Utc::now(),
         })
@@ -499,6 +514,7 @@ impl ExecutionBroker for SimulatedBroker {
             filled_quantity: order.quantity,
             average_price: Some(order.reference_price),
             rejection_reason: None,
+            raw_fix_report: None,
             created_by_event_id: execution_event_id.into(),
             executed_at: Utc::now(),
         })
@@ -506,6 +522,10 @@ impl ExecutionBroker for SimulatedBroker {
 
     fn reference_price(&self, _instrument: &str) -> Result<Option<f64>> {
         Ok(Some(100.0))
+    }
+
+    fn supports_instrument(&self, _instrument: &str) -> Result<bool> {
+        Ok(true)
     }
 
     fn reconcile(&self) -> Result<BrokerSnapshot> {

@@ -22,7 +22,11 @@ pub struct UpdateStatus {
 
 impl UpdateStatus {
     fn new(state: &str, message: impl Into<String>, version: Option<String>) -> Self {
-        Self { state: state.into(), message: message.into(), version }
+        Self {
+            state: state.into(),
+            message: message.into(),
+            version,
+        }
     }
 }
 
@@ -40,17 +44,18 @@ struct ReleaseAsset {
 struct CheckGuard;
 
 impl Drop for CheckGuard {
-    fn drop(&mut self) { CHECKING.store(false, Ordering::Release); }
+    fn drop(&mut self) {
+        CHECKING.store(false, Ordering::Release);
+    }
 }
 
 fn github_token(project_root: &Path) -> Option<String> {
-    let from_env = std::env::var("ESPEON_GITHUB_TOKEN").ok()
-        .filter(|value| !value.trim().is_empty());
-    let from_file = std::fs::read_to_string(project_root.join(".env"))
+    let from_env = std::env::var("ESPEON_GITHUB_TOKEN")
         .ok()
-        .and_then(|contents| contents.lines().filter_map(|line| line.split_once('='))
-            .find(|(name, _)| name.trim() == "ESPEON_GITHUB_TOKEN")
-            .map(|(_, value)| value.trim().to_owned()))
+        .filter(|value| !value.trim().is_empty());
+    let from_file = crate::config::env_file_values(project_root)
+        .ok()
+        .and_then(|values| values.get("ESPEON_GITHUB_TOKEN").cloned())
         .filter(|value| !value.is_empty());
     if let Some(token) = from_env.or(from_file) {
         return Some(token);
@@ -63,9 +68,18 @@ fn github_token(project_root: &Path) -> Option<String> {
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x0800_0000);
     }
-    command.output().ok().and_then(|output| {
-        if output.status.success() { String::from_utf8(output.stdout).ok() } else { None }
-    }).map(|value| value.trim().to_owned()).filter(|value| !value.is_empty())
+    command
+        .output()
+        .ok()
+        .and_then(|output| {
+            if output.status.success() {
+                String::from_utf8(output.stdout).ok()
+            } else {
+                None
+            }
+        })
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
 }
 
 pub async fn check(
@@ -74,12 +88,19 @@ pub async fn check(
     controller: Arc<Mutex<HarnessController>>,
     installing: Arc<AtomicBool>,
 ) -> UpdateStatus {
-    if CHECKING.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+    if CHECKING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
         return UpdateStatus::new("checking", "An update check is already running.", None);
     }
     let _guard = CheckGuard;
     let Some(token) = github_token(project_root) else {
-        return UpdateStatus::new("authRequired", "Connect GitHub in settings to receive private releases.", None);
+        return UpdateStatus::new(
+            "authRequired",
+            "Connect GitHub in settings to receive private releases.",
+            None,
+        );
     };
     match check_authenticated(app, &token, controller, installing).await {
         Ok(status) => status,
@@ -97,44 +118,82 @@ async fn check_authenticated(
         .timeout(Duration::from_secs(30))
         .build()
         .map_err(|error| format!("Could not prepare update check: {error}"))?;
-    let response = client.get(RELEASE_URL)
+    let response = client
+        .get(RELEASE_URL)
         .header("User-Agent", "Espeon-Updater")
         .header("Accept", "application/vnd.github+json")
         .bearer_auth(token)
-        .send().await
+        .send()
+        .await
         .map_err(|error| format!("Could not reach GitHub releases: {error}"))?;
     if response.status() == reqwest::StatusCode::NOT_FOUND {
-        return Ok(UpdateStatus::new("authRequired", "No release is available, or this GitHub account cannot access it.", None));
+        return Ok(UpdateStatus::new(
+            "authRequired",
+            "No release is available, or this GitHub account cannot access it.",
+            None,
+        ));
     }
-    if response.status() == reqwest::StatusCode::UNAUTHORIZED || response.status() == reqwest::StatusCode::FORBIDDEN {
-        return Ok(UpdateStatus::new("authRequired", "GitHub access expired. Update the read-only token in settings.", None));
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED
+        || response.status() == reqwest::StatusCode::FORBIDDEN
+    {
+        return Ok(UpdateStatus::new(
+            "authRequired",
+            "GitHub access expired. Update the read-only token in settings.",
+            None,
+        ));
     }
-    let response = response.error_for_status().map_err(|error| format!("Release check failed: {error}"))?;
-    let release: Release = response.json().await.map_err(|error| format!("Invalid release metadata: {error}"))?;
-    let manifest = release.assets.iter().find(|asset| asset.name == "latest.json")
+    let response = response
+        .error_for_status()
+        .map_err(|error| format!("Release check failed: {error}"))?;
+    let release: Release = response
+        .json()
+        .await
+        .map_err(|error| format!("Invalid release metadata: {error}"))?;
+    let manifest = release
+        .assets
+        .iter()
+        .find(|asset| asset.name == "latest.json")
         .ok_or_else(|| "The latest release has no signed update manifest.".to_owned())?;
-    let endpoint = manifest.url.parse().map_err(|error| format!("Invalid update URL: {error}"))?;
-    let update = app.updater_builder()
+    let endpoint = manifest
+        .url
+        .parse()
+        .map_err(|error| format!("Invalid update URL: {error}"))?;
+    let update = app
+        .updater_builder()
         .header("Authorization", format!("Bearer {token}"))
         .map_err(|error| format!("Could not set updater authentication: {error}"))?
         .header("Accept", "application/octet-stream")
         .map_err(|error| format!("Could not set updater asset format: {error}"))?
-        .endpoints(vec![endpoint]).map_err(|error| format!("Invalid updater endpoint: {error}"))?
-        .build().map_err(|error| format!("Could not prepare updater: {error}"))?
-        .check().await.map_err(|error| format!("Signed update check failed: {error}"))?;
+        .endpoints(vec![endpoint])
+        .map_err(|error| format!("Invalid updater endpoint: {error}"))?
+        .build()
+        .map_err(|error| format!("Could not prepare updater: {error}"))?
+        .check()
+        .await
+        .map_err(|error| format!("Signed update check failed: {error}"))?;
     let Some(update) = update else {
         return Ok(UpdateStatus::new("current", "Espeon is up to date.", None));
     };
     let version = update.version.clone();
     if controller.lock().has_active_runs() {
-        return Ok(UpdateStatus::new("waiting", "Update ready; installation waits until active experiments stop.", Some(version)));
+        return Ok(UpdateStatus::new(
+            "waiting",
+            "Update ready; installation waits until active experiments stop.",
+            Some(version),
+        ));
     }
-    let package = update.download(|_, _| {}, || {})
-        .await.map_err(|error| format!("Update download or signature verification failed: {error}"))?;
+    let package = update
+        .download(|_, _| {}, || {})
+        .await
+        .map_err(|error| format!("Update download or signature verification failed: {error}"))?;
     installing.store(true, Ordering::SeqCst);
     if controller.lock().has_active_runs() {
         installing.store(false, Ordering::SeqCst);
-        return Ok(UpdateStatus::new("waiting", "Update ready; installation waits until active experiments stop.", Some(version)));
+        return Ok(UpdateStatus::new(
+            "waiting",
+            "Update ready; installation waits until active experiments stop.",
+            Some(version),
+        ));
     }
     if let Err(error) = update.install(package) {
         installing.store(false, Ordering::SeqCst);

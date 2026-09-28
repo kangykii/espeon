@@ -1,14 +1,23 @@
+#![recursion_limit = "256"]
+
 mod adapters;
 mod config;
 mod context;
+mod contracts;
 mod ctrader_fix;
 mod domain;
+mod evidence;
+mod freshness;
 mod harness;
+mod jev_compiler;
+mod market_cache;
 mod market_data;
+mod mcp_context;
 mod ports;
 mod replay;
 mod retrieval;
 mod risk;
+mod skills;
 mod storage;
 mod typesafe;
 mod updates;
@@ -26,16 +35,25 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
+use std::thread::JoinHandle;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 struct AppState {
     controller: Arc<Mutex<HarnessController>>,
+    canonical_store: storage::CanonicalStore,
+    market_data: Arc<dyn ports::MarketDataProvider>,
     restored_run_ids: Vec<String>,
     project_root: PathBuf,
-    retrieval_ready: bool,
+    retrieval_ready: Arc<AtomicBool>,
+    retrieval_config: retrieval::RetrievalConfig,
     installing_update: Arc<AtomicBool>,
-    run_cancellations: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    run_workers: Mutex<HashMap<String, RunWorker>>,
+}
+
+struct RunWorker {
+    cancellation: Arc<AtomicBool>,
+    handle: JoinHandle<()>,
 }
 
 impl AppState {
@@ -62,20 +80,17 @@ impl AppState {
             defaults["worldModelAdapter"] = "simulated".into();
             defaults["jevAdapter"] = "simulated".into();
             defaults["brokerAdapter"] = "simulated".into();
-            std::fs::write(&config_path, serde_json::to_string_pretty(&defaults)? + "\n")?;
+            std::fs::write(
+                &config_path,
+                serde_json::to_string_pretty(&defaults)? + "\n",
+            )?;
         }
         let config = config::HarnessConfig::load(&project_root)?;
         let runtime_path = config.runtime_path(&project_root)?;
         let store = storage::CanonicalStore::open(&runtime_path)?;
+        let canonical_store = store.clone();
         let retrieval_config = retrieval::RetrievalConfig::load(&project_root)?;
-        let context_pool = match retrieval::QdrantContextPool::new(retrieval_config) {
-            Ok(pool) => Some(pool),
-            Err(error) => {
-                eprintln!("Local context index unavailable: {error}");
-                None
-            }
-        };
-        let retrieval_ready = context_pool.is_some();
+        let retrieval_ready = Arc::new(AtomicBool::new(false));
         let world_model: Box<dyn ports::WorldModel> = match config.world_model_adapter.as_str() {
             "openrouter" => match world_model_api::OpenRouterWorldModel::load(&project_root) {
                 Ok(adapter) => Box::new(adapter),
@@ -98,26 +113,33 @@ impl AppState {
         };
         let (broker, market_data): (
             Box<dyn ports::ExecutionBroker>,
-            Box<dyn ports::MarketDataProvider>,
+            Arc<dyn ports::MarketDataProvider>,
         ) = match config.broker_adapter.as_str() {
             "ctrader-fix" => match ctrader_fix::CTraderFixConfig::load(&project_root) {
                 Ok(fix_config) => {
-                    let market_data: Box<dyn ports::MarketDataProvider> =
-                        match market_data::CTraderOpenApiConfig::load(&project_root).and_then(
-                            |open_api| {
-                                market_data::HybridCTraderMarketDataProvider::new(
-                                    fix_config.clone(),
-                                    open_api,
-                                )
-                            },
+                    let market_data: Arc<dyn ports::MarketDataProvider> =
+                        match market_cache::MarketContextCacheProvider::start(
+                            &runtime_path,
+                            &project_root,
+                            fix_config.clone(),
                         ) {
-                            Ok(provider) => Box::new(provider),
-                            Err(error) => Box::new(market_data::UnavailableMarketDataProvider(
-                                format!("cTrader live-context pipeline unavailable: {error}"),
+                            Ok(provider) => Arc::new(provider),
+                            Err(error) => Arc::new(market_data::UnavailableMarketDataProvider(
+                                format!("local live-context cache unavailable: {error}"),
                             )),
                         };
                     (
-                        Box::new(ctrader_fix::CTraderFixBroker::new(fix_config)),
+                        Box::new(ctrader_fix::CTraderFixBroker::with_entry_validation(
+                            fix_config.clone(),
+                            fix_config.validate_mcp_identity().and_then(|_| {
+                                mcp_context::McpExecutionValidator::start(
+                                    &project_root,
+                                    ctrader_fix::CTraderFixQuoteFeed::configured_symbols(
+                                        &fix_config,
+                                    ),
+                                )
+                            }),
+                        )),
                         market_data,
                     )
                 }
@@ -125,51 +147,83 @@ impl AppState {
                     Box::new(adapters::UnavailableBroker(format!(
                         "cTrader FIX unavailable: {error}"
                     ))),
-                    Box::new(market_data::UnavailableMarketDataProvider(format!(
+                    Arc::new(market_data::UnavailableMarketDataProvider(format!(
                         "cTrader FIX price feed unavailable: {error}"
                     ))),
                 ),
             },
             _ => (
                 Box::new(adapters::SimulatedBroker),
-                Box::new(market_data::SimulatedMarketDataProvider::new()),
+                Arc::new(market_data::SimulatedMarketDataProvider::new()),
             ),
         };
         let mut controller = HarnessController::with_optional_retrieval_adapters(
             store,
             config.minimum_confidence,
-            context_pool,
+            None,
             world_model,
             jev,
             broker,
             config.risk_policy,
         );
-        controller.configure_market_data(market_data);
+        controller.configure_market_data(Arc::clone(&market_data));
         controller.configure_autonomous_reviews(config.autonomous_review.clone());
         let restored = controller.restore_active_runs()?;
         let controller = Arc::new(Mutex::new(controller));
         Ok(Self {
             controller,
+            canonical_store,
+            market_data,
             restored_run_ids: restored,
             project_root,
             retrieval_ready,
+            retrieval_config,
             installing_update: Arc::new(AtomicBool::new(false)),
-            run_cancellations: Mutex::new(HashMap::new()),
+            run_workers: Mutex::new(HashMap::new()),
         })
     }
 }
 
+fn run_snapshot_from_store(
+    store: &storage::CanonicalStore,
+    run_id: &str,
+) -> anyhow::Result<RunSnapshot> {
+    let replay = replay::replay_run(store, run_id)?;
+    Ok(RunSnapshot {
+        run_id: run_id.to_owned(),
+        status: replay.status,
+        thesis: replay.human_thesis,
+        hypotheses: replay.hypotheses,
+        cadences: replay.cadences,
+        loops: replay.loops,
+        positions: replay.positions,
+        events: store.events_for_run(run_id)?,
+    })
+}
+
+fn workspace_snapshot_from_store(
+    store: &storage::CanonicalStore,
+    integrations: Vec<IntegrationStatus>,
+) -> anyhow::Result<WorkspaceSnapshot> {
+    let run_history = store.run_summaries()?;
+    let active_runs = run_history
+        .iter()
+        .filter(|run| run.status == "active")
+        .map(|run| run_snapshot_from_store(store, &run.run_id))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(WorkspaceSnapshot {
+        active_runs,
+        run_history,
+        integrations,
+        hydrated_at: chrono::Utc::now(),
+    })
+}
+
 fn env_setting(project_root: &std::path::Path, name: &str) -> Option<String> {
-    std::fs::read_to_string(project_root.join(".env"))
+    crate::config::env_file_values(project_root)
         .ok()
-        .and_then(|contents| {
-            contents
-                .lines()
-                .filter_map(|line| line.split_once('='))
-                .find(|(key, _)| key.trim() == name)
-                .map(|(_, value)| value.trim().to_owned())
-                .filter(|value| !value.is_empty())
-        })
+        .and_then(|values| values.get(name).cloned())
+        .filter(|value| !value.trim().is_empty())
         .or_else(|| {
             std::env::var(name)
                 .ok()
@@ -205,19 +259,19 @@ fn integration_statuses(
     let mcp_enabled = env_setting(project_root, "CTRADER_MCP_ENABLED")
         .map(|value| value.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
+    let mcp_identity_configured = mcp_enabled
+        && configured(
+            project_root,
+            &["CTRADER_MCP_ACCOUNT_ID", "CTRADER_MCP_ENVIRONMENT"],
+        );
+    let volume_scale_configured = configured(project_root, &["CTRADER_FIX_MCP_VOLUME_SCALE"]);
     let price_fix = configured(
         project_root,
         &["CTRADER_FIX_PRICE_HOST", "CTRADER_FIX_PRICE_USERNAME"],
     );
-    let open_api = configured(
+    let twelve_data = configured(
         project_root,
-        &[
-            "CTRADER_OPEN_API_CLIENT_ID",
-            "CTRADER_OPEN_API_CLIENT_SECRET",
-            "CTRADER_OPEN_API_ACCESS_TOKEN",
-            "CTRADER_OPEN_API_ACCOUNT_ID",
-            "CTRADER_OPEN_API_SYMBOL_MAP",
-        ],
+        &["TWELVE_DATA_API_KEY", "TWELVE_DATA_SYMBOL_MAP"],
     );
     let trade_fix = configured(
         project_root,
@@ -239,8 +293,16 @@ fn integration_statuses(
         status(
             "qdrant",
             "Qdrant",
-            if retrieval_ready { "connected" } else { "degraded" },
-            if retrieval_ready { "Local context index ready" } else { "Local context index unavailable" },
+            if retrieval_ready {
+                "connected"
+            } else {
+                "degraded"
+            },
+            if retrieval_ready {
+                "Local context index ready"
+            } else {
+                "Local context index unavailable"
+            },
         ),
         status(
             "openrouter",
@@ -265,25 +327,33 @@ fn integration_statuses(
         status(
             "mcp",
             "cTrader MCP",
-            if mcp_enabled {
+            if mcp_identity_configured {
+                "configured"
+            } else if mcp_enabled {
+                "degraded"
+            } else {
+                "disabled"
+            },
+            if mcp_identity_configured {
+                "Read-only account identity and symbol-volume checks configured; live risk values can be human-verified for one decision cycle"
+            } else if mcp_enabled {
+                "MCP account, environment, or endpoint missing"
+            } else {
+                "Read-only adapter disabled; new FIX entries are blocked"
+            },
+        ),
+        status(
+            "twelve-data-market-data",
+            "Twelve Data",
+            if twelve_data {
                 "configured"
             } else {
                 "disabled"
             },
-            if mcp_enabled {
-                "Read-only context adapter enabled"
+            if twelve_data {
+                "REST candle confirmation and WebSocket price configured"
             } else {
-                "Read-only adapter disabled"
-            },
-        ),
-        status(
-            "open-api-market-data",
-            "cTrader candles",
-            if open_api { "configured" } else { "degraded" },
-            if open_api {
-                "Open API completed-bar backfill configured"
-            } else {
-                "Open API history credentials missing"
+                "Optional external data unavailable; qualified FIX price bars remain available"
             },
         ),
         status(
@@ -303,23 +373,77 @@ fn integration_statuses(
         status(
             "fix-trade",
             "FIX trade",
-            if trade_fix && config.broker_adapter == "ctrader-fix" {
+            if config.broker_adapter != "ctrader-fix" {
+                "disabled"
+            } else {
+                "degraded"
+            },
+            if config.broker_adapter != "ctrader-fix" {
+                "Simulated broker selected"
+            } else if trade_fix && mcp_identity_configured && volume_scale_configured {
+                "FIX trade session configured; automatic account-risk snapshots are unavailable, so use the one-cycle human verification panel when live account values are not returned"
+            } else if trade_fix {
+                "Trade credentials present; automatic account-risk snapshots are unavailable. The one-cycle human verification panel can supply current account values and symbol limits"
+            } else {
+                "FIX trade session not configured; live entries also require a broker risk snapshot provider"
+            },
+        ),
+        status(
+            "broker-risk",
+            "Broker risk sizing",
+            if config.broker_adapter == "simulated" {
                 "configured"
             } else {
                 "degraded"
             },
-            if trade_fix {
-                "Trade session credentials present"
+            if config.broker_adapter == "simulated" {
+                "Paper risk policy is scoped to the simulated broker"
             } else {
-                "Trade session not configured"
+                "Automatic live risk snapshots are unavailable. Live entries require one human-verified cycle with account-bound equity, free margin, currency conversion, account exposure, and symbol limits"
             },
         ),
     ]
 }
 
+fn emit_snapshot(app: &AppHandle, snapshot: &RunSnapshot) {
+    if let Err(error) = app.emit("harness:snapshot", snapshot) {
+        eprintln!(
+            "Failed to deliver harness snapshot for run {}: {error}",
+            snapshot.run_id
+        );
+    }
+}
+
+fn emit_error(app: &AppHandle, run_id: &str, message: &str) {
+    eprintln!("Harness run {run_id}: {message}");
+    if let Err(error) = app.emit(
+        "harness:error",
+        serde_json::json!({"runId":run_id,"message":message}),
+    ) {
+        eprintln!("Failed to deliver harness error for run {run_id}: {error}");
+    }
+}
+
+fn report_worker_failure(
+    controller: &Arc<Mutex<HarnessController>>,
+    app: &AppHandle,
+    run_id: &str,
+    stage: &str,
+    message: &str,
+) {
+    if let Err(error) = controller
+        .lock()
+        .record_worker_failure(run_id, stage, message)
+    {
+        eprintln!("Failed to persist {stage} worker failure for run {run_id}: {error:#}");
+    }
+    emit_error(app, run_id, message);
+}
+
 #[tauri::command]
 async fn start_run(
     thesis: String,
+    continuation_from_run_id: Option<String>,
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<RunSnapshot, String> {
@@ -328,42 +452,72 @@ async fn start_run(
     let snapshot = tauri::async_runtime::spawn_blocking(move || {
         let mut controller = controller.lock();
         if installing_update.load(Ordering::SeqCst) {
-            return Err("Espeon is installing an update; start the experiment after restart.".into());
+            return Err(
+                "Espeon is installing an update; start the experiment after restart.".into(),
+            );
         }
-        controller.start(&thesis).map_err(|error| error.to_string())
+        match continuation_from_run_id.as_deref() {
+            Some(source_run_id) => controller.continue_from_run(&thesis, source_run_id),
+            None => controller.start(&thesis),
+        }
+        .map_err(|error| format!("{error:#}"))
     })
     .await
     .map_err(|error| format!("start-run worker failed: {error}"))??;
     let run_id = snapshot.run_id.clone();
     let cancellation = Arc::new(AtomicBool::new(false));
-    state
-        .run_cancellations
-        .lock()
-        .insert(run_id.clone(), Arc::clone(&cancellation));
-    let _ = app.emit("harness:snapshot", &snapshot);
-    spawn_run_loop(Arc::clone(&state.controller), run_id, cancellation, app);
+    emit_snapshot(&app, &snapshot);
+    let handle = spawn_run_loop(
+        Arc::clone(&state.controller),
+        Arc::clone(&state.market_data),
+        run_id.clone(),
+        Arc::clone(&cancellation),
+        app,
+    );
+    state.run_workers.lock().insert(
+        run_id,
+        RunWorker {
+            cancellation,
+            handle,
+        },
+    );
     Ok(snapshot)
 }
 
 fn spawn_run_loop(
     controller: Arc<Mutex<HarnessController>>,
+    market_data: Arc<dyn ports::MarketDataProvider>,
     run_id: String,
     cancellation: Arc<AtomicBool>,
     app: AppHandle,
-) {
+) -> JoinHandle<()> {
     thread::spawn(move || loop {
         if cancellation.load(Ordering::SeqCst) {
             break;
         }
-        let interval = {
+        let interval_result = {
             let mut controller = controller.lock();
             if !controller.is_active(&run_id) {
                 break;
             }
             if controller.take_immediate_cycle(&run_id) {
-                0
+                Ok(0)
             } else {
-                controller.cycle_interval_seconds(&run_id).unwrap_or(60)
+                controller.cycle_interval_seconds(&run_id)
+            }
+        };
+        let interval = match interval_result {
+            Ok(interval) => interval,
+            Err(error) => {
+                report_worker_failure(
+                    &controller,
+                    &app,
+                    &run_id,
+                    "cadence",
+                    &format!("Jev cadence unavailable: {error:#}"),
+                );
+                thread::sleep(Duration::from_secs(1));
+                continue;
             }
         };
         let deadline = std::time::Instant::now() + Duration::from_secs(interval);
@@ -379,6 +533,78 @@ fn spawn_run_loop(
         }
         if cancellation.load(Ordering::SeqCst) {
             break;
+        }
+        if let Err(error) = controller.lock().enforce_due_contract_stops(&run_id) {
+            report_worker_failure(
+                &controller,
+                &app,
+                &run_id,
+                "contract_stop",
+                &format!("Contract stop enforcement failed before market refresh: {error:#}"),
+            );
+            continue;
+        }
+        let requests = {
+            let controller = controller.lock();
+            if !controller.is_active(&run_id) {
+                break;
+            }
+            controller.market_requests(&run_id)
+        };
+        let requests = match requests {
+            Ok(requests) => requests,
+            Err(error) => {
+                report_worker_failure(
+                    &controller,
+                    &app,
+                    &run_id,
+                    "market_requests",
+                    &format!("Market-data requirements failed: {error:#}"),
+                );
+                continue;
+            }
+        };
+        for request in requests {
+            if cancellation.load(Ordering::SeqCst) {
+                break;
+            }
+            if market_data.snapshot(&request).is_err() {
+                if let Err(error) = market_data.refresh(&request) {
+                    report_worker_failure(
+                        &controller,
+                        &app,
+                        &run_id,
+                        "market_refresh",
+                        &format!(
+                            "Market-data refresh failed for {}: {error:#}",
+                            request.instrument
+                        ),
+                    );
+                }
+            }
+        }
+        if cancellation.load(Ordering::SeqCst) {
+            break;
+        }
+        let pending_activation = controller
+            .lock()
+            .advance_pending_startup_activation(&run_id);
+        match pending_activation {
+            Ok(Some(snapshot)) => {
+                emit_snapshot(&app, &snapshot);
+                continue;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                report_worker_failure(
+                    &controller,
+                    &app,
+                    &run_id,
+                    "contract_activation",
+                    &format!("Pending HypothesisContract activation failed: {error:#}"),
+                );
+                continue;
+            }
         }
         let result = {
             let mut controller = controller.lock();
@@ -396,20 +622,35 @@ fn spawn_run_loop(
         };
         match result {
             Ok((snapshot, jobs, model, (max_attempts, retry_base_seconds))) => {
-                let _ = app.emit("harness:snapshot", snapshot);
+                emit_snapshot(&app, &snapshot);
                 for job in jobs {
                     if cancellation.load(Ordering::SeqCst) {
-                        let _ = controller.lock().record_review_job_state(
+                        if let Err(error) = controller.lock().record_review_job_state(
                             &job,
                             "cancelled",
                             0,
                             Some("run stopped before provider call"),
-                        );
+                        ) {
+                            emit_error(
+                                &app,
+                                &run_id,
+                                &format!("Review cancellation checkpoint failed: {error:#}"),
+                            );
+                        }
                         break;
                     }
-                    let _ = controller
+                    if let Err(error) = controller
                         .lock()
-                        .record_review_job_state(&job, "running", 0, None);
+                        .record_review_job_state(&job, "running", 0, None)
+                    {
+                        emit_error(
+                            &app,
+                            &run_id,
+                            &format!("Review start checkpoint failed: {error:#}"),
+                        );
+                        controller.lock().requeue_review_job(job);
+                        break;
+                    }
                     let mut final_result = None;
                     for attempt in 1..=max_attempts {
                         let attempt_result = model.review_hypothesis(&job.package);
@@ -420,12 +661,24 @@ fn spawn_run_loop(
                             }
                             Err(error) if attempt < max_attempts => {
                                 let message = error.to_string();
-                                let _ = controller.lock().record_review_job_state(
-                                    &job,
-                                    "retrying",
-                                    attempt,
-                                    Some(&message),
-                                );
+                                if let Err(checkpoint_error) =
+                                    controller.lock().record_review_job_state(
+                                        &job,
+                                        "retrying",
+                                        attempt,
+                                        Some(&message),
+                                    )
+                                {
+                                    emit_error(
+                                        &app,
+                                        &run_id,
+                                        &format!(
+                                            "Review retry checkpoint failed: {checkpoint_error:#}"
+                                        ),
+                                    );
+                                    controller.lock().requeue_review_job(job.clone());
+                                    break;
+                                }
                                 let delay = retry_base_seconds
                                     .saturating_mul(1u64 << attempt.saturating_sub(1).min(8));
                                 let deadline =
@@ -453,12 +706,18 @@ fn spawn_run_loop(
                         }
                     }
                     if cancellation.load(Ordering::SeqCst) {
-                        let _ = controller.lock().record_review_job_state(
+                        if let Err(error) = controller.lock().record_review_job_state(
                             &job,
                             "cancelled",
                             0,
                             Some("run stopped while provider work was in flight"),
-                        );
+                        ) {
+                            emit_error(
+                                &app,
+                                &run_id,
+                                &format!("Review cancellation checkpoint failed: {error:#}"),
+                            );
+                        }
                         break;
                     }
                     if let Some(review_result) = final_result {
@@ -467,13 +726,10 @@ fn spawn_run_loop(
                             .complete_autonomous_review(&job, review_result)
                         {
                             Ok(snapshot) => {
-                                let _ = app.emit("harness:snapshot", snapshot);
+                                emit_snapshot(&app, &snapshot);
                             }
                             Err(error) => {
-                                let _ = app.emit(
-                                    "harness:error",
-                                    serde_json::json!({"runId":run_id,"message":error.to_string()}),
-                                );
+                                emit_error(&app, &run_id, &error.to_string());
                             }
                         }
                     }
@@ -483,13 +739,16 @@ fn spawn_run_loop(
                 if cancellation.load(Ordering::SeqCst) {
                     break;
                 }
-                let _ = app.emit(
-                    "harness:error",
-                    serde_json::json!({"runId":run_id,"message":error.to_string()}),
+                report_worker_failure(
+                    &controller,
+                    &app,
+                    &run_id,
+                    "cycle",
+                    &format!("Jev cycle stopped before completion: {error:#}"),
                 );
             }
         }
-    });
+    })
 }
 
 #[tauri::command]
@@ -498,28 +757,96 @@ async fn stop_run(
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<RunSnapshot, String> {
-    let cancellation = state.run_cancellations.lock().get(&run_id).cloned();
-    if let Some(cancellation) = &cancellation {
-        cancellation.store(true, Ordering::SeqCst);
+    let worker = state.run_workers.lock().remove(&run_id);
+    if let Some(worker) = &worker {
+        worker.cancellation.store(true, Ordering::SeqCst);
     }
     let controller = Arc::clone(&state.controller);
     let stop_run_id = run_id.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
-        controller
-            .lock()
-            .stop(&stop_run_id)
-            .map_err(|error| error.to_string())
+        if let Some(worker) = worker {
+            let _ = worker.handle.join();
+        }
+        let mut last_error = String::new();
+        for attempt in 0..3 {
+            if attempt > 0 {
+                thread::sleep(Duration::from_secs(attempt as u64));
+            }
+            match controller.lock().stop(&stop_run_id) {
+                Ok(snapshot) => return Ok(snapshot),
+                Err(error) => last_error = format!("{error:#}"),
+            }
+        }
+        Err(last_error)
     })
     .await
     .map_err(|error| format!("stop-run worker failed: {error}"))?;
     let snapshot = match result {
-        Ok(snapshot) => {
-            state.run_cancellations.lock().remove(&run_id);
-            snapshot
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            if let Err(record_error) =
+                state
+                    .controller
+                    .lock()
+                    .record_worker_failure(&run_id, "operator_stop", &error)
+            {
+                eprintln!(
+                    "Failed to persist operator-stop failure for run {run_id}: {record_error:#}"
+                );
+            }
+            emit_error(&app, &run_id, &error);
+            let resume_stop_recovery = {
+                let mut controller = state.controller.lock();
+                let active = controller.is_active(&run_id);
+                if active {
+                    controller.schedule_immediate_cycle(&run_id);
+                }
+                active
+            };
+            if resume_stop_recovery {
+                let cancellation = Arc::new(AtomicBool::new(false));
+                let handle = spawn_run_loop(
+                    Arc::clone(&state.controller),
+                    Arc::clone(&state.market_data),
+                    run_id.clone(),
+                    Arc::clone(&cancellation),
+                    app.clone(),
+                );
+                state.run_workers.lock().insert(
+                    run_id.clone(),
+                    RunWorker {
+                        cancellation,
+                        handle,
+                    },
+                );
+            }
+            return Err(error);
         }
-        Err(error) => return Err(error),
     };
-    let _ = app.emit("harness:snapshot", &snapshot);
+    emit_snapshot(&app, &snapshot);
+    let (packages, world_model) = {
+        let mut controller = state.controller.lock();
+        (
+            controller.take_stop_wrapups(&run_id),
+            controller.world_model(),
+        )
+    };
+    if !packages.is_empty() {
+        let controller = Arc::clone(&state.controller);
+        let app_for_wrapup = app.clone();
+        thread::spawn(move || {
+            for package in packages {
+                let result = world_model.review_hypothesis(&package);
+                if let Err(error) = controller.lock().record_stop_wrapup(&package, result) {
+                    emit_error(
+                        &app_for_wrapup,
+                        &package.run_id,
+                        &format!("Stopped-run retrospective could not be recorded: {error:#}"),
+                    );
+                }
+            }
+        });
+    }
     Ok(snapshot)
 }
 
@@ -538,22 +865,22 @@ async fn review_hypothesis(
     })
     .await
     .map_err(|error| format!("review worker failed: {error}"))??;
-    let _ = app.emit("harness:snapshot", &snapshot);
+    emit_snapshot(&app, &snapshot);
     Ok(snapshot)
 }
 
 #[tauri::command]
 async fn hydrate_workspace(state: State<'_, AppState>) -> Result<WorkspaceSnapshot, String> {
     let project_root = state.project_root.clone();
-    let retrieval_ready = state.retrieval_ready;
-    let controller = Arc::clone(&state.controller);
+    let retrieval_ready = state.retrieval_ready.load(Ordering::SeqCst);
+    let canonical_store = state.canonical_store.clone();
+    let market_data = Arc::clone(&state.market_data);
     tauri::async_runtime::spawn_blocking(move || {
         let config =
             config::HarnessConfig::load(&project_root).map_err(|error| error.to_string())?;
-        let integrations = integration_statuses(&project_root, &config, retrieval_ready);
-        controller
-            .lock()
-            .workspace_snapshot(integrations)
+        let mut integrations = integration_statuses(&project_root, &config, retrieval_ready);
+        integrations.extend(market_data.health_statuses());
+        workspace_snapshot_from_store(&canonical_store, integrations)
             .map_err(|error| error.to_string())
     })
     .await
@@ -561,17 +888,33 @@ async fn hydrate_workspace(state: State<'_, AppState>) -> Result<WorkspaceSnapsh
 }
 
 #[tauri::command]
-async fn check_for_updates(app: AppHandle, state: State<'_, AppState>) -> Result<updates::UpdateStatus, String> {
+async fn get_market_health(state: State<'_, AppState>) -> Result<Vec<IntegrationStatus>, String> {
+    let controller = Arc::clone(&state.controller);
+    tauri::async_runtime::spawn_blocking(move || controller.lock().market_data_statuses())
+        .await
+        .map_err(|error| format!("market-health worker failed: {error}"))
+}
+
+#[tauri::command]
+async fn check_for_updates(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<updates::UpdateStatus, String> {
     Ok(updates::check(
         app,
         &state.project_root,
         Arc::clone(&state.controller),
         Arc::clone(&state.installing_update),
-    ).await)
+    )
+    .await)
 }
 
 #[tauri::command]
-async fn rename_run(run_id: String, name: String, state: State<'_, AppState>) -> Result<(), String> {
+async fn rename_run(
+    run_id: String,
+    name: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
     let controller = Arc::clone(&state.controller);
     tauri::async_runtime::spawn_blocking(move || {
         controller
@@ -606,6 +949,64 @@ fn get_connector_settings(state: State<'_, AppState>) -> Result<config::Connecto
 }
 
 #[tauri::command]
+async fn probe_mcp_connection(state: State<'_, AppState>) -> Result<String, String> {
+    let root = state.project_root.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        mcp_context::McpBrokerContext::probe(&root).map_err(|error| format!("{error:#}"))
+    })
+    .await
+    .map_err(|error| format!("MCP connection check failed: {error}"))?
+}
+
+#[tauri::command]
+async fn approve_human_verified_live_cycle(
+    run_id: String,
+    account_id: String,
+    environment: String,
+    instrument: String,
+    equity: f64,
+    free_margin: f64,
+    deposit_currency: String,
+    account_open_exposure: f64,
+    quote_to_deposit: f64,
+    volume_minimum: Option<f64>,
+    volume_step: Option<f64>,
+    confirmed: bool,
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<RunSnapshot, String> {
+    let controller = Arc::clone(&state.controller);
+    let snapshot = tauri::async_runtime::spawn_blocking(move || {
+        let mut risk_snapshot = ports::BrokerRiskSnapshot {
+            account_id,
+            environment,
+            equity,
+            free_margin,
+            deposit_asset_id: deposit_currency.clone(),
+            deposit_currency_code: deposit_currency,
+            observed_at: chrono::Utc::now(),
+            account_open_exposure,
+            quote_to_deposit: HashMap::from([(instrument, quote_to_deposit)]),
+        };
+        risk_snapshot.observed_at = chrono::Utc::now();
+        controller
+            .lock()
+            .run_human_verified_live_cycle(
+                &run_id,
+                risk_snapshot,
+                volume_minimum,
+                volume_step,
+                confirmed,
+            )
+            .map_err(|error| format!("human-verified live cycle failed: {error:#}"))
+    })
+    .await
+    .map_err(|error| format!("human-verified live-cycle worker failed: {error}"))??;
+    emit_snapshot(&app, &snapshot);
+    Ok(snapshot)
+}
+
+#[tauri::command]
 fn save_connector_settings(
     update: config::ConnectorSettingsUpdate,
     state: State<'_, AppState>,
@@ -618,12 +1019,9 @@ async fn get_run_snapshot(
     run_id: String,
     state: State<'_, AppState>,
 ) -> Result<RunSnapshot, String> {
-    let controller = Arc::clone(&state.controller);
+    let canonical_store = state.canonical_store.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        controller
-            .lock()
-            .run_snapshot(&run_id)
-            .map_err(|error| error.to_string())
+        run_snapshot_from_store(&canonical_store, &run_id).map_err(|error| error.to_string())
     })
     .await
     .map_err(|error| format!("snapshot worker failed: {error}"))?
@@ -663,12 +1061,9 @@ async fn search_context(
 
 #[tauri::command]
 async fn replay_run(run_id: String, state: State<'_, AppState>) -> Result<ReplayState, String> {
-    let controller = Arc::clone(&state.controller);
+    let canonical_store = state.canonical_store.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        controller
-            .lock()
-            .replay(&run_id)
-            .map_err(|error| error.to_string())
+        replay::replay_run(&canonical_store, &run_id).map_err(|error| error.to_string())
     })
     .await
     .map_err(|error| format!("replay worker failed: {error}"))?
@@ -713,24 +1108,82 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(state)
         .setup(|app| {
-            let (controller, run_ids) = {
+            let (controller, market_data, run_ids, retrieval_config, retrieval_ready) = {
                 let state = app.state::<AppState>();
                 (
                     Arc::clone(&state.controller),
+                    Arc::clone(&state.market_data),
                     state.restored_run_ids.clone(),
+                    state.retrieval_config.clone(),
+                    Arc::clone(&state.retrieval_ready),
                 )
             };
+            let retrieval_controller = Arc::clone(&controller);
+            thread::spawn(
+                move || match retrieval::QdrantContextPool::new(retrieval_config) {
+                    Ok(pool) => {
+                        let store = retrieval_controller.lock().canonical_store_handle();
+                        match pool.rebuild_if_needed(&store) {
+                            Ok(rebuilt) => {
+                                if rebuilt {
+                                    eprintln!("Rebuilt compact evidence index from canonical events");
+                                }
+                                let indexing = (|| -> anyhow::Result<()> {
+                                    for run in store.run_summaries()? {
+                                        pool.sync_pending_events(&store, &run.run_id)
+                                            .map_err(|error| {
+                                                anyhow::anyhow!("run {}: {error:#}", run.run_id)
+                                            })?;
+                                    }
+                                    retrieval_controller
+                                        .lock()
+                                        .configure_context_pool(pool);
+                                    let (pool, store) = retrieval_controller
+                                        .lock()
+                                        .pending_indexer()
+                                        .ok_or_else(|| {
+                                            anyhow::anyhow!(
+                                                "context pool disappeared during bootstrap"
+                                            )
+                                        })?;
+                                    for run in store.run_summaries()? {
+                                        pool.sync_pending_events(&store, &run.run_id)
+                                            .map_err(|error| {
+                                                anyhow::anyhow!("run {}: {error:#}", run.run_id)
+                                            })?;
+                                    }
+                                    Ok(())
+                                })();
+                                match indexing {
+                                    Ok(()) => retrieval_ready.store(true, Ordering::SeqCst),
+                                    Err(error) => eprintln!(
+                                        "Deferred evidence indexing failed; retrieval stays unavailable until retry: {error:#}"
+                                    ),
+                                }
+                            }
+                            Err(error) => eprintln!(
+                                "Compact evidence index rebuild failed; retrieval stays unavailable until retry: {error:#}"
+                            ),
+                        }
+                    }
+                    Err(error) => eprintln!("Local context index unavailable: {error:#}"),
+                },
+            );
             for run_id in run_ids {
                 let cancellation = Arc::new(AtomicBool::new(false));
-                app.state::<AppState>()
-                    .run_cancellations
-                    .lock()
-                    .insert(run_id.clone(), Arc::clone(&cancellation));
-                spawn_run_loop(
+                let handle = spawn_run_loop(
                     Arc::clone(&controller),
-                    run_id,
-                    cancellation,
+                    Arc::clone(&market_data),
+                    run_id.clone(),
+                    Arc::clone(&cancellation),
                     app.handle().clone(),
+                );
+                app.state::<AppState>().run_workers.lock().insert(
+                    run_id,
+                    RunWorker {
+                        cancellation,
+                        handle,
+                    },
                 );
             }
             Ok(())
@@ -740,6 +1193,7 @@ pub fn run() {
             stop_run,
             review_hypothesis,
             hydrate_workspace,
+            get_market_health,
             check_for_updates,
             rename_run,
             set_run_archived,
@@ -750,6 +1204,8 @@ pub fn run() {
             retrieve_context,
             ingest_context,
             get_connector_settings,
+            probe_mcp_connection,
+            approve_human_verified_live_cycle,
             save_connector_settings
         ])
         .run(tauri::generate_context!())

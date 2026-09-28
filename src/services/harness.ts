@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import type { ConnectorSettings, ConnectorSettingsUpdate, ReplayState, RunSnapshot, SearchHit, UpdateStatus, WorkspaceSnapshot } from "../types";
+import type { ConnectorSettings, ConnectorSettingsUpdate, IntegrationStatus, ReplayState, RunSnapshot, SearchHit, UpdateStatus, WorkspaceSnapshot } from "../types";
 
 const isTauri = "__TAURI_INTERNALS__" in window;
 
@@ -27,6 +27,10 @@ export const harnessService = {
     return isTauri ? invoke("hydrate_workspace") : Promise.resolve(browserPreview);
   },
 
+  marketHealth(): Promise<IntegrationStatus[]> {
+    return isTauri ? invoke("get_market_health") : Promise.resolve([]);
+  },
+
   checkForUpdates(): Promise<UpdateStatus> {
     return isTauri ? invoke("check_for_updates") : Promise.resolve({ state: "current", message: "Updates are available in the desktop app.", version: null });
   },
@@ -41,9 +45,9 @@ export const harnessService = {
     return invoke("set_run_archived", { runId, archived });
   },
 
-  startRun(thesis: string): Promise<RunSnapshot> {
+  startRun(thesis: string, continuationFromRunId: string | null = null): Promise<RunSnapshot> {
     if (!isTauri) return Promise.reject(new Error("Start runs from the Tauri desktop application."));
-    return invoke("start_run", { thesis });
+    return invoke("start_run", { thesis, continuationFromRunId });
   },
 
   stopRun(runId: string): Promise<RunSnapshot> {
@@ -69,6 +73,42 @@ export const harnessService = {
   getConnectorSettings(): Promise<ConnectorSettings> {
     if (!isTauri) return Promise.reject(new Error("Connector settings are available in the desktop application."));
     return invoke("get_connector_settings");
+  },
+
+  probeMcpConnection(): Promise<string> {
+    if (!isTauri) return Promise.reject(new Error("cTrader MCP checks require the desktop application."));
+    return invoke("probe_mcp_connection");
+  },
+
+  approveHumanVerifiedLiveCycle(input: {
+    runId: string;
+    accountId: string;
+    environment: string;
+    instrument: string;
+    equity: number;
+    freeMargin: number;
+    depositCurrency: string;
+    accountOpenExposure: number;
+    quoteToDeposit: number;
+    volumeMinimum: number | null;
+    volumeStep: number | null;
+    confirmed: boolean;
+  }): Promise<RunSnapshot> {
+    if (!isTauri) return Promise.reject(new Error("Live risk verification is available in the desktop application."));
+    return invoke("approve_human_verified_live_cycle", {
+      runId: input.runId,
+      accountId: input.accountId,
+      environment: input.environment,
+      instrument: input.instrument,
+      equity: input.equity,
+      freeMargin: input.freeMargin,
+      depositCurrency: input.depositCurrency,
+      accountOpenExposure: input.accountOpenExposure,
+      quoteToDeposit: input.quoteToDeposit,
+      volumeMinimum: input.volumeMinimum,
+      volumeStep: input.volumeStep,
+      confirmed: input.confirmed,
+    });
   },
 
   saveConnectorSettings(update: ConnectorSettingsUpdate): Promise<ConnectorSettings> {

@@ -10,29 +10,33 @@ import { icons, renderIcons } from "./icons";
 import { renderPositionsChart, type PnlRange } from "./positionsChart";
 import type { ConnectorSettings, ConnectorSettingsUpdate, ContextRecord, Decision, EventView, Hypothesis, LoopView, ReplayState, RunSnapshot, SearchHit, UpdateStatus, WorkspaceSnapshot } from "./types";
 
-type Tab = "activity" | "positions" | "evidence" | "history";
+type Tab = "home" | "activity" | "positions" | "evidence" | "history";
 type Theme = "light" | "dark";
 const app = document.querySelector<HTMLDivElement>("#app")!;
 const preferences = {
   theme: (localStorage.getItem("jev.ui.theme") as Theme) || "light",
-  sidebarCollapsed: localStorage.getItem("jev.ui.sidebar-collapsed") === "true",
+  sidebarCollapsed: localStorage.getItem("jev.ui.sidebar-collapsed") !== "false",
   inspectorCollapsed: localStorage.getItem("jev.ui.inspector-collapsed") === "true",
   sidebarWidth: Number(localStorage.getItem("jev.ui.sidebar-width")) || 292,
   inspectorWidth: Number(localStorage.getItem("jev.ui.inspector-width")) || 344,
 };
-let compactSidebarOpen = false;
 let compactInspectorOpen = false;
 let pnlRange: PnlRange = "all";
 let promptDraft = "";
+let settingsPage = "overview";
 let updateStatus: UpdateStatus | null = null;
 let updateChecking = false;
+let mcpChecking = false;
+let mcpProbeMessage = "";
+let liveRiskApprovalBusy = false;
+let liveRiskApprovalMessage = "";
 let updateRetryTimer: number | null = null;
-const sidebarIsCollapsed = () => window.innerWidth <= 820 ? !compactSidebarOpen : preferences.sidebarCollapsed;
+const sidebarIsCollapsed = () => preferences.sidebarCollapsed;
 const inspectorIsCollapsed = () => window.innerWidth <= 1080 ? !compactInspectorOpen : preferences.inspectorCollapsed;
-const state: { workspace: WorkspaceSnapshot | null; selectedSnapshot: RunSnapshot | null; selectedRunId: string | null; selectedLoopId: string | null; selectedEvidenceId: string | null; replay: ReplayState | null; tab: Tab; searchResults: SearchHit[]; searchQuery: string; notice: string; noticeTone: "neutral" | "error" | "success"; loading: boolean; stoppingRunId: string | null; settingsOpen: boolean; connectorSettings: ConnectorSettings | null; settingsSaving: boolean; showArchived: boolean; renamingRunId: string | null } = {
+const state: { workspace: WorkspaceSnapshot | null; selectedSnapshot: RunSnapshot | null; selectedRunId: string | null; selectedLoopId: string | null; selectedEvidenceId: string | null; replay: ReplayState | null; tab: Tab; searchResults: SearchHit[]; searchQuery: string; notice: string; noticeTone: "neutral" | "error" | "success"; loading: boolean; stoppingRunId: string | null; settingsOpen: boolean; connectorSettings: ConnectorSettings | null; settingsSaving: boolean; showArchived: boolean; renamingRunId: string | null; editingTitleRunId: string | null } = {
   workspace: null, selectedSnapshot: null, selectedRunId: null, selectedLoopId: null, selectedEvidenceId: null, replay: null,
-  tab: "activity", searchResults: [], searchQuery: "", notice: "Hydrating local workspace…", noticeTone: "neutral", loading: true,
-  stoppingRunId: null, settingsOpen: false, connectorSettings: null, settingsSaving: false, showArchived: false, renamingRunId: null,
+  tab: "home", searchResults: [], searchQuery: "", notice: "Hydrating local workspace…", noticeTone: "neutral", loading: true,
+  stoppingRunId: null, settingsOpen: false, connectorSettings: null, settingsSaving: false, showArchived: false, renamingRunId: null, editingTitleRunId: null,
 };
 
 function escapeHtml(value: unknown): string { const node = document.createElement("div"); node.textContent = String(value ?? ""); return node.innerHTML; }
@@ -43,7 +47,10 @@ function relativeTime(value: string): string { const minutes = Math.floor((Date.
 function currentSnapshot(): RunSnapshot | null {
   const active = state.workspace?.activeRuns.find((run) => run.runId === state.selectedRunId);
   if (active) return active;
-  return state.selectedSnapshot?.status === "active" ? state.selectedSnapshot : null;
+  return state.selectedSnapshot?.runId === state.selectedRunId && state.selectedSnapshot.status === "active" ? state.selectedSnapshot : null;
+}
+function selectedRunSnapshot(): RunSnapshot | null {
+  return state.selectedSnapshot?.runId === state.selectedRunId ? state.selectedSnapshot : currentSnapshot();
 }
 function currentHypotheses(): Hypothesis[] { return state.replay?.hypotheses ?? currentSnapshot()?.hypotheses ?? []; }
 function currentLoops(): LoopView[] { return state.replay?.loops ?? currentSnapshot()?.loops ?? []; }
@@ -55,12 +62,15 @@ function selectedEvidence(): ContextRecord | null { const records = state.replay
 
 function liveContextSection(decision: Decision | null): string {
   const snapshot = decision?.resolvedState.liveContextSnapshot;
+  const symbol = hypothesisFor(selectedLoop())?.instruments[0] ?? "";
+  const feedStates = (state.workspace?.integrations ?? []).filter((item) => item.id.startsWith("market-") && item.id.endsWith(`:${symbol}`));
+  const healthRows = feedStates.length ? `<dl>${feedStates.map((item) => `${definitionRow(item.label, `${item.state}: ${item.detail}`)}`).join("")}</dl>` : `<p class="muted">Feed workers have not reported health yet.</p>`;
   if (!snapshot) {
-    return `<section class="inspector-section"><h3>Live market context</h3><p class="muted">No resolved live snapshot yet. A missing or stale feed skips Jev and is recorded in Activity.</p></section>`;
+    return `<section class="inspector-section"><h3>Live market context</h3><p class="muted">No resolved live snapshot yet. A missing or stale feed skips Jev and is recorded in Activity.</p>${healthRows}</section>`;
   }
   const latest = [...snapshot.candles].sort((a, b) => b.openTime.localeCompare(a.openTime))[0];
-  const formulaRows = snapshot.fields.map((field) => `<div class="context-item"><strong>${escapeHtml(field.label)}</strong><span>${escapeHtml(String(field.value))}</span><small>${escapeHtml(JSON.stringify(field.formula))}</small><time>${dateTime(field.observedAt)} · ${escapeHtml(field.provenance.join(", "))}</time></div>`).join("");
-  return `<section class="inspector-section"><h3>Live market context</h3><dl>${definitionRow("Snapshot", shortId(snapshot.id), true)}${definitionRow("Freshness", snapshot.freshnessState)}${definitionRow("Bid / Ask", `${snapshot.quote.bid} / ${snapshot.quote.ask}`)}${definitionRow("Mid / Spread", `${snapshot.quote.mid} / ${snapshot.quote.spread}`)}${definitionRow("Quote received", dateTime(snapshot.quote.receivedAt))}${definitionRow("Latest closed bar", latest ? `${latest.period} · ${dateTime(latest.openTime)} · O ${latest.open} H ${latest.high} L ${latest.low} C ${latest.close}` : "None")}</dl>${formulaRows}</section>`;
+  const formulaRows = snapshot.fields.map((field) => `<div class="context-item"><strong>${escapeHtml(field.label)}</strong><span>${escapeHtml(String(field.value))}</span><small>${escapeHtml(JSON.stringify(field.formula))}</small><time>${dateTime(field.observedAt)} · ${escapeHtml(field.provenance.join(", "))} · ${escapeHtml((field.sourceObservationIds ?? []).map(shortId).join(", "))}</time></div>`).join("");
+  return `<section class="inspector-section"><h3>Live market context</h3><dl>${definitionRow("Snapshot", shortId(snapshot.id), true)}${definitionRow("Freshness", snapshot.freshnessState)}${definitionRow("Data route", snapshot.qualityState ?? "legacy")}${definitionRow("Bid / Ask", `${snapshot.quote.bid} / ${snapshot.quote.ask}`)}${definitionRow("Mid / Spread", `${snapshot.quote.mid} / ${snapshot.quote.spread}`)}${definitionRow("Quote received", dateTime(snapshot.quote.receivedAt))}${definitionRow("Latest closed bar", latest ? `${latest.period} · ${dateTime(latest.openTime)} · O ${latest.open} H ${latest.high} L ${latest.low} C ${latest.close}` : "None")}${definitionRow("Bar source", latest?.provenance)}${definitionRow("Volume measure", latest?.volumeKind ?? "legacy")}${definitionRow("Provider volume", latest?.providerVolume ?? "unavailable")}</dl>${formulaRows}<h3>Feed services</h3>${healthRows}</section>`;
 }
 function statusChip(value: string, label = value): string {
   const tone = /active|connected|filled|accepted|approved|long|buy|keep|eligible/i.test(value) ? "positive" : /blocked|reject|error|stopped|short|sell|degraded|invalid/i.test(value) ? "negative" : /configured|hold|pending|jev2|modify|split/i.test(value) ? "warning" : "neutral";
@@ -76,7 +86,7 @@ function windowChrome(): string {
   const windowControls = harnessService.isDesktop
     ? `<div aria-label="Window controls" class="window-chrome-controls" role="group"><button aria-label="Minimize" class="window-control" id="window-minimize" title="Minimize" type="button">${icons.minimize}</button><button aria-label="Maximize" class="window-control" id="window-maximize" title="Maximize" type="button">${icons.maximize}</button><button aria-label="Close" class="window-control" id="window-close" title="Close" type="button">${icons.close}</button></div>`
     : "";
-  return `<div aria-hidden="true" class="window-frame-overlay"></div><header class="window-chrome ${harnessService.isDesktop ? "" : "window-chrome-browser"}"><div aria-label="Espeon controls" class="window-chrome-actions" role="group"><button aria-label="Toggle sidebar" aria-expanded="${!sidebarIsCollapsed()}" class="window-chrome-action" id="toggle-sidebar" title="Toggle sidebar (Ctrl+B)" type="button">${icons.panel}</button><button aria-label="New run" class="window-chrome-action" id="new-run" title="New run (Ctrl+N)" type="button">${icons.plus}</button><button aria-label="Search experiments" class="window-chrome-action" id="chrome-search" title="Search experiments (Ctrl+K)" type="button">${icons.search}</button><button aria-label="Connectors and settings" class="window-chrome-action" id="open-settings" title="Connectors and settings" type="button">${icons.settings}</button><button aria-label="Toggle theme" class="window-chrome-action" id="toggle-theme" title="Toggle theme" type="button">${preferences.theme === "dark" ? icons.sun : icons.moon}</button><button aria-label="Toggle context" aria-expanded="${!inspectorIsCollapsed()}" class="window-chrome-action" id="toggle-inspector" title="Toggle context (Ctrl+I)" type="button">${icons.inspect}</button></div><div class="window-chrome-drag"><span>Espeon</span></div>${windowControls}</header>`;
+  return `<div aria-hidden="true" class="window-frame-overlay"></div><header class="window-chrome ${harnessService.isDesktop ? "" : "window-chrome-browser"}"><div aria-label="Espeon controls" class="window-chrome-actions" role="group"><button aria-label="Home" class="window-chrome-action" id="go-home" title="Home" type="button"><svg viewBox="0 0 24 24"><path d="m3 10 9-7 9 7"/><path d="M5 9v12h14V9M9 21v-7h6v7"/></svg></button><span aria-hidden="true" class="window-chrome-separator"></span><button aria-label="Toggle sidebar" aria-expanded="${!sidebarIsCollapsed()}" class="window-chrome-action" id="toggle-sidebar" title="Toggle session sidebar (Ctrl+B)" type="button">${icons.panel}</button><button aria-label="New run" class="window-chrome-action" id="new-run" title="New session (Ctrl+N)" type="button">${icons.plus}</button><span aria-hidden="true" class="window-chrome-separator"></span><button aria-label="Toggle context" aria-expanded="${!inspectorIsCollapsed()}" class="window-chrome-action" id="toggle-inspector" title="Toggle session context (Ctrl+I)" type="button">${icons.inspect}</button><button aria-label="Connectors and settings" class="window-chrome-action" id="open-settings" title="Connectors and settings" type="button">${icons.settings}</button><button aria-label="Toggle theme" class="window-chrome-action" id="toggle-theme" title="Toggle theme" type="button">${preferences.theme === "dark" ? icons.sun : icons.moon}</button></div><div class="window-chrome-drag"><span>Espeon</span></div>${windowControls}</header>`;
 }
 
 function sidebar(): string {
@@ -85,6 +95,7 @@ function sidebar(): string {
 }
 
 function eventKind(event: EventView): { label: string; tone: string } {
+  if (event.kind.startsWith("market_service_state_changed") || event.kind.startsWith("live_context_")) return { label: "Market data", tone: "market" };
   if (/decision|jev/i.test(event.kind)) return { label: "Jev", tone: "jev" };
   if (/execution|position|fill/i.test(event.kind)) return { label: "Execution", tone: "execution" };
   if (/guardrail|order/i.test(event.kind)) return { label: "Harness", tone: "harness" };
@@ -93,7 +104,49 @@ function eventKind(event: EventView): { label: string; tone: string } {
   return { label: "System", tone: "system" };
 }
 
+function activityLabel(event: EventView): string {
+  const labels: Record<string, string> = {
+    harness_worker_failed: "Harness recovery blocked",
+    broker_sync_failed: "Broker reconciliation failed",
+    broker_sync_degraded: "Broker snapshot incomplete",
+    market_service_state_changed: "Feed status",
+    live_context_resolution_failed: "Waiting for candles",
+    live_context_resolved: "Live context ready",
+    jev1_decision_recorded: "Jev entry decision",
+    jev2_decision_recorded: "Jev position decision",
+    order_evaluated: "Deterministic risk check",
+    execution_recorded: "Broker execution result",
+  };
+  return labels[event.kind] ?? event.kind.replaceAll("_", " ");
+}
+
+function activityDescription(event: EventView): string {
+  return event.detail?.trim() || event.summary?.trim() || "This event was recorded in the run activity.";
+}
+
+function routineActivity(event: EventView): boolean {
+  return ["broker_state_synchronized", "live_context_resolved", "loop_cadence_mapped"].includes(event.kind);
+}
+
 function eventDetails(event: EventView): string {
+  if (["harness_worker_failed", "broker_sync_failed", "broker_sync_degraded"].includes(event.kind)) {
+    return `<p>${escapeHtml(event.detail || event.summary || "The run is waiting for recovery to become safe.")}</p>`;
+  }
+  if (event.kind === "live_context_resolution_failed") {
+    return `<p>${escapeHtml(event.detail || "Required live market data is not ready. Jev was not called and no order was sent.")}</p>`;
+  }
+  if (event.kind === "order_evaluated" || event.kind === "guardrail_evaluated") {
+    const rejected = event.detail?.startsWith("Rejected:") ?? false;
+    const accepted = event.detail?.startsWith("Approved:") ?? false;
+    const label = event.kind === "guardrail_evaluated"
+      ? accepted ? "Risk gate passed" : rejected ? "Risk gate blocked" : "Risk result unavailable"
+      : accepted ? "Order approved" : rejected ? "Order rejected" : "Risk result unavailable";
+    const reason = event.detail?.replace(/^(Approved|Rejected):\s*/, "");
+    return `<p><span class="chip" data-tone="${rejected ? "negative" : accepted ? "positive" : "warning"}">${label}</span> ${escapeHtml(reason || event.summary || "Risk evaluation result unavailable.")}</p>`;
+  }
+  if (event.kind === "market_service_state_changed" || event.kind === "live_context_resolved") {
+    return event.detail ? `<p>${escapeHtml(event.detail)}</p>` : event.summary ? `<p>${escapeHtml(event.summary)}</p>` : "";
+  }
   const decision = state.replay?.decisions.find((item) => item.id === event.aggregateId);
   if (decision) return `<div class="structured-line"><span>Action</span><strong>${escapeHtml(decision.action)}</strong><span>Confidence</span><strong>${(decision.confidence * 100).toFixed(0)}%</strong></div><p>${escapeHtml(decision.rationale)}</p>`;
   const execution = state.replay?.executions.find((item) => item.executionId === event.aggregateId);
@@ -107,11 +160,33 @@ function eventDetails(event: EventView): string {
   return event.summary ? `<p>${escapeHtml(event.summary)}</p>` : "";
 }
 
+function marketWarmupBanner(events: EventView[]): string {
+  if (currentSnapshot()?.status !== "active") return "";
+  const contextEvent = [...events].reverse().find((event) => event.kind === "live_context_resolution_failed" || event.kind === "live_context_resolved");
+  if (!contextEvent) {
+    return `<section class="market-warmup" data-state="waiting" aria-live="polite"><div class="market-warmup-heading"><span class="market-warmup-badge">PREPARING</span><div><h2>Warming up market data</h2><p>Espeon is collecting a fresh cTrader quote and the required completed candles. Jev and order checks wait until live context is ready.</p></div></div>${marketPath(0)}</section>`;
+  }
+  const ready = contextEvent.kind === "live_context_resolved";
+  const cadence = contextEvent.loopId ? state.replay?.cadences.find((item) => item.loopId === contextEvent.loopId) : undefined;
+  const retrySeconds = cadence?.jev1IntervalSeconds;
+  const retry = retrySeconds ? `The loop checks again on its ${retrySeconds >= 60 ? `${Math.round(retrySeconds / 60)}-minute` : `${retrySeconds}-second`} cycle.` : "The loop will retry on its next scheduled cycle.";
+  const message = ready
+    ? "Fresh live context was resolved. Jev evaluates it next; any order still has to pass deterministic risk checks."
+    : `${contextEvent.detail || "Espeon needs 15 complete, contiguous, fresh M1 candles before it can call Jev."} Jev was skipped; no order was sent. ${retry}`;
+  return `<section class="market-warmup" data-state="${ready ? "ready" : "waiting"}" aria-live="polite"><div class="market-warmup-heading"><span class="market-warmup-badge">${ready ? "READY" : "WARMING UP"}</span><div><h2>${ready ? "Live context is ready for Jev" : "Waiting for market data"}</h2><p>${escapeHtml(message)}</p></div></div>${marketPath(ready ? 1 : 0)}</section>`;
+}
+
+function marketPath(completedThrough: number): string {
+  const steps = ["Market data", "Live context", "Jev", "Risk checks", "cTrader FIX"];
+  return `<ol class="market-warmup-path" aria-label="Trade decision path">${steps.map((step, index) => `<li data-step="${index < completedThrough ? "done" : index === completedThrough ? "current" : "pending"}"><span>${index + 1}</span><strong>${step}</strong></li>`).join("")}</ol>`;
+}
+
 function activityView(): string {
-  const events = currentSnapshot()?.events ?? [];
+  const events = selectedRunSnapshot()?.events ?? [];
   if (!state.selectedRunId) return welcomeView();
   if (!events.length) return `<div class="empty-state"><span class="empty-icon">${icons.activity}</span><h2>Waiting for canonical activity</h2><p>World-model, Jev, harness, and execution events will appear here.</p></div>`;
-  return `<div class="activity-stream">${[...events].reverse().map((event) => { const kind = eventKind(event); return `<article class="activity-card" data-tone="${kind.tone}"><div class="activity-rail"><span class="activity-node"></span></div><div class="activity-content"><div class="activity-header"><span class="activity-source">${escapeHtml(kind.label)}</span><span class="activity-kind">${escapeHtml(event.kind.replaceAll("_", " "))}</span><time>${dateTime(event.occurredAt)}</time></div>${eventDetails(event)}<div class="canonical-ref"><span>#${event.sequence}</span><code>${escapeHtml(shortId(event.id))}</code><span>${escapeHtml(event.aggregateType)}</span></div></div></article>`; }).join("")}</div>`;
+  const orderedEvents = [...events].reverse();
+  return `<div class="activity-scroll-layout"><nav class="activity-navigator" id="activity-navigator" role="group" aria-label="Activity navigator. Select a marker or use arrow keys to jump through events." aria-controls="workbench-scroll" tabindex="0"><ol class="activity-navigator-track">${orderedEvents.map((event, index) => { const kind = eventKind(event); const routine = routineActivity(event); const label = activityLabel(event); const description = activityDescription(event); return `<li class="activity-mark-row" data-activity-index="${index}"><button class="activity-mark ${routine ? "is-routine" : "is-major"}" data-activity-index="${index}" type="button" aria-label="Jump to ${escapeHtml(kind.label)}: ${escapeHtml(label)}. ${escapeHtml(description)}"><span class="activity-mark-line" aria-hidden="true"></span><span class="activity-mark-preview" role="tooltip"><strong>${escapeHtml(label)}</strong><span>${escapeHtml(description)}</span></span></button></li>`; }).join("")}</ol></nav><div class="activity-feed" id="activity-feed">${marketWarmupBanner(events)}<div class="activity-stream">${orderedEvents.map((event, index) => { const kind = eventKind(event); return `<article class="activity-card ${routineActivity(event) ? "is-routine" : ""}" data-activity-index="${index}" data-tone="${kind.tone}"><div class="activity-content"><div class="activity-header"><span class="activity-source">${escapeHtml(kind.label)}</span><span class="activity-kind">${escapeHtml(activityLabel(event))}</span><time>${dateTime(event.occurredAt)}</time></div>${eventDetails(event)}<div class="canonical-ref" title="Canonical event sequence #${event.sequence}"><span>${escapeHtml(event.aggregateType)}</span><span>#${events.length - index}</span><code>${escapeHtml(shortId(event.id))}</code></div></div></article>`; }).join("")}</div></div></div>`;
 }
 
 function positionRows(): string {
@@ -142,11 +217,16 @@ function evidenceView(): string {
 function historyView(): string {
   const allRuns = state.workspace?.runHistory ?? [];
   const runs = allRuns.filter((run) => run.archived === state.showArchived);
-  return `<div class="history-view"><div class="content-section-heading"><div><h2>${state.showArchived ? "Archived" : "Recent"} experiments</h2></div><div class="history-filters"><button class="${state.showArchived ? "" : "is-active"}" data-history-filter="recent" type="button">Recent</button><button class="${state.showArchived ? "is-active" : ""}" data-history-filter="archived" type="button">Archived</button></div></div><div class="history-table">${runs.map((run) => `<article class="history-card"><button class="history-card-open" data-open-run="${escapeHtml(run.runId)}" type="button"><span class="history-state" data-state="${escapeHtml(run.status)}"></span><span class="history-card-copy"><strong>${escapeHtml(run.thesis)}</strong><small>${dateTime(run.startedAt)} · ${escapeHtml(run.status)}</small></span><code>${escapeHtml(shortId(run.runId))}</code>${icons.chevron}</button><div class="history-card-actions"><button data-rename-run="${escapeHtml(run.runId)}" type="button" title="Rename experiment">${icons.rename}<span>Rename</span></button><button data-archive-run="${escapeHtml(run.runId)}" data-archived="${run.archived}" type="button" title="${run.status === "active" ? "Stop the experiment before archiving" : run.archived ? "Restore experiment" : "Archive experiment"}" ${run.status === "active" ? "disabled" : ""}>${run.archived ? icons.restoreArchive : icons.archive}<span>${run.archived ? "Restore" : "Archive"}</span></button></div></article>`).join("") || `<div class="empty-state compact"><h3>${state.showArchived ? "No archived experiments" : "No experiments yet"}</h3></div>`}</div></div>`;
+  return `<div class="history-view"><div class="content-section-heading"><div><h2>Experiments</h2></div><div class="history-filters" role="group" aria-label="Filter experiments"><button class="${state.showArchived ? "" : "is-active"}" aria-pressed="${!state.showArchived}" data-history-filter="recent" type="button">Recent</button><button class="${state.showArchived ? "is-active" : ""}" aria-pressed="${state.showArchived}" data-history-filter="archived" type="button">Archived</button></div></div><div class="history-table">${runs.map((run) => `<article class="history-card"><button class="history-card-open" data-open-run="${escapeHtml(run.runId)}" type="button"><span class="history-state" data-state="${escapeHtml(run.status)}"></span><span class="history-card-copy"><strong>${escapeHtml(run.thesis)}</strong><small>${dateTime(run.startedAt)} · ${escapeHtml(run.status)}</small></span><code>${escapeHtml(shortId(run.runId))}</code>${icons.chevron}</button><div class="history-card-actions"><button data-rename-run="${escapeHtml(run.runId)}" type="button" title="Rename experiment">${icons.rename}<span>Rename</span></button><button data-archive-run="${escapeHtml(run.runId)}" data-archived="${run.archived}" type="button" title="${run.status === "active" ? "Stop the experiment before archiving" : run.archived ? "Restore experiment" : "Archive experiment"}" ${run.status === "active" ? "disabled" : ""}>${run.archived ? icons.restoreArchive : icons.archive}<span>${run.archived ? "Restore" : "Archive"}</span></button></div></article>`).join("") || `<div class="empty-state compact"><h3>${state.showArchived ? "No archived experiments" : "No experiments yet"}</h3></div>`}</div></div>`;
 }
 
 function welcomeView(): string {
   return `<div class="welcome"><h1>What hypothesis should the harness test?</h1><p>Describe the market behavior in plain language. The world model will create a versioned hypothesis, select context, and start a supervised Jev loop.</p><div class="welcome-notes"><span>Rust-authoritative state</span><span>No per-trade approvals</span><span>Full canonical replay</span></div></div>`;
+}
+
+function homeView(): string {
+  const recent = (state.workspace?.runHistory ?? []).filter((run) => !run.archived).slice(0, 5);
+  return `<section class="home-page"><div class="home-intro"><span class="home-eyebrow">ESPEON</span><h1>What are we testing?</h1><p>Describe a trading hypothesis or market behavior to start a session.</p></div><form class="composer home-composer" id="run-composer"><div class="composer-shell"><textarea id="thesis-input" rows="2" placeholder="Describe a trading hypothesis or vague market behavior…" ${state.loading ? "disabled" : ""}>${escapeHtml(promptDraft)}</textarea><div class="composer-footer"><div><span class="composer-mode">Autonomous</span><span class="composer-detail">World model → Jev → deterministic harness</span></div><button class="send-button" type="submit" title="Start run (Ctrl+Enter)">${state.loading ? `<span class="spinner small"></span>` : icons.arrow}</button></div></div></form><section class="home-recent"><header><h2>Recent sessions</h2><button class="section-link" id="view-all-home" type="button">View all ${icons.chevron}</button></header><div class="home-session-list">${recent.map((run) => `<button class="home-session" data-open-run="${escapeHtml(run.runId)}" type="button"><span class="history-state" data-state="${escapeHtml(run.status)}"></span><span><strong>${escapeHtml(run.thesis)}</strong><small>${escapeHtml(run.status)} · ${relativeTime(run.startedAt)}</small></span>${icons.chevron}</button>`).join("") || `<p class="home-empty">Your recent trading sessions will appear here.</p>`}</div></section></section>`;
 }
 
 function tabContent(): string {
@@ -158,9 +238,16 @@ function tabContent(): string {
 }
 
 function mainPanel(): string {
-  const snapshot = currentSnapshot(); const historyRun = state.workspace?.runHistory.find((run) => run.runId === state.selectedRunId); const title = state.tab === "history" ? "All experiments" : historyRun?.thesis || snapshot?.thesis || "New autonomous run";
+  if (state.tab === "home") return `<main class="workbench-main home-mode"><section class="workbench-scroll home-scroll">${homeView()}</section></main>`;
+  if (state.tab === "history") return `<main class="history-page"><section class="history-scroll">${historyView()}</section></main>`;
+  const snapshot = currentSnapshot(); const historyRun = state.workspace?.runHistory.find((run) => run.runId === state.selectedRunId); const title = historyRun?.thesis || snapshot?.thesis || "New autonomous run";
   const stopping = snapshot !== null && state.stoppingRunId === snapshot.runId;
-  return `<main class="workbench-main ${state.tab === "history" ? "history-mode" : ""}"><header class="workbench-header"><div class="header-title"><div><h1>${escapeHtml(title)}</h1></div></div><div class="header-actions">${snapshot && state.tab !== "history" ? `<button class="secondary-button danger" id="stop-run" type="button" ${stopping ? "disabled" : ""}>${stopping ? `<span class="spinner small"></span>` : icons.stop}<span>${stopping ? "Stopping…" : "Stop run"}</span></button>` : ""}</div></header><nav class="tabs" aria-label="Run views">${(["activity", "positions", "evidence"] as Tab[]).map((tab) => `<button type="button" data-tab="${tab}" class="${state.tab === tab ? "is-active" : ""}">${icons[tab === "positions" ? "position" : tab]}<span>${tab[0].toUpperCase() + tab.slice(1)}</span>${tab === "activity" && snapshot ? `<em>${snapshot.events.length}</em>` : ""}</button>`).join("")}${state.tab === "history" ? `<button type="button" data-tab="history" class="is-active">${icons.history}<span>View all</span></button>` : ""}</nav>${state.notice ? `<div class="notice" data-tone="${state.noticeTone}"><span>${escapeHtml(state.notice)}</span><button aria-label="Dismiss notice" id="dismiss-notice" type="button">${icons.close}</button></div>` : ""}<section class="workbench-scroll" id="workbench-scroll">${tabContent()}</section>${state.tab === "history" ? "" : `<form class="composer" id="run-composer"><div class="composer-shell"><textarea id="thesis-input" rows="2" placeholder="Describe a trading hypothesis or vague market behavior…" ${state.loading ? "disabled" : ""}>${escapeHtml(promptDraft)}</textarea><div class="composer-footer"><div><span class="composer-mode">Autonomous</span><span class="composer-detail">World model → Jev → deterministic harness</span></div><button class="send-button" type="submit" title="Start run (Ctrl+Enter)">${state.loading ? `<span class="spinner small"></span>` : icons.arrow}</button></div></div></form>`}</main>`;
+  const editingTitle = state.editingTitleRunId === state.selectedRunId && Boolean(state.selectedRunId);
+  const titleView = editingTitle
+    ? `<form class="run-title-edit" id="run-title-form"><input id="run-title-input" name="name" value="${escapeHtml(title)}" maxlength="120" required autocomplete="off" aria-label="Trade title"/><button type="submit" class="icon-button" title="Save title" aria-label="Save title">${icons.check}</button><button type="button" class="icon-button" id="cancel-title-edit" title="Cancel" aria-label="Cancel title edit">${icons.close}</button></form>`
+    : `<h1 id="run-title" ${state.selectedRunId ? 'title="Double-click to rename"' : ""}>${escapeHtml(title)}</h1>${state.selectedRunId ? `<button class="title-edit-button" id="edit-run-title" type="button" aria-label="Rename trade" title="Rename trade">${icons.rename}</button>` : ""}`;
+  const continuationLabel = state.selectedRunId ? `Continuing from ${shortId(state.selectedRunId)} · history informs a new run` : "World model → Jev → deterministic harness";
+  return `<main class="workbench-main"><header class="workbench-header"><div class="header-title"><div class="run-title-wrap">${titleView}</div></div><div class="header-actions"><nav class="tabs" aria-label="Run views" role="group">${(["activity", "positions", "evidence"] as const).map((tab) => `<button type="button" data-tab="${tab}" aria-pressed="${state.tab === tab}" class="${state.tab === tab ? "is-active" : ""}">${icons[tab === "positions" ? "position" : tab]}<span>${tab[0].toUpperCase() + tab.slice(1)}</span>${tab === "activity" && selectedRunSnapshot() ? `<em>${selectedRunSnapshot()!.events.length}</em>` : ""}</button>`).join("")}</nav>${snapshot ? `<button class="secondary-button danger" id="stop-run" type="button" ${stopping ? "disabled" : ""}>${stopping ? `<span class="spinner small"></span>` : icons.stop}<span>${stopping ? "Stopping…" : "Stop run"}</span></button>` : ""}</div></header>${state.notice ? `<div class="notice" data-tone="${state.noticeTone}"><span>${escapeHtml(state.notice)}</span><button aria-label="Dismiss notice" id="dismiss-notice" type="button">${icons.close}</button></div>` : ""}<section class="workbench-scroll" id="workbench-scroll">${tabContent()}</section><form class="composer" id="run-composer"><div class="composer-shell"><textarea id="thesis-input" rows="2" placeholder="${state.selectedRunId ? "Continue with a new instruction using this run as context…" : "Describe a trading hypothesis or vague market behavior…"}" ${state.loading ? "disabled" : ""}>${escapeHtml(promptDraft)}</textarea><div class="composer-footer"><div><span class="composer-mode">Autonomous</span><span class="composer-detail">${escapeHtml(continuationLabel)}</span></div><button class="send-button" type="submit" title="${state.selectedRunId ? "Continue from this run" : "Start run"} (Ctrl+Enter)">${state.loading ? `<span class="spinner small"></span>` : icons.arrow}</button></div></div></form></main>`;
 }
 
 function definitionRow(label: string, value: unknown, mono = false): string { return `<div class="definition-row"><dt>${escapeHtml(label)}</dt><dd class="${mono ? "mono" : ""}">${escapeHtml(value ?? "—")}</dd></div>`; }
@@ -201,10 +288,49 @@ function inspector(): string {
 function settingsModal(): string {
   if (!state.settingsOpen) return "";
   const settings = state.connectorSettings;
-  const content = !settings
-    ? `<div class="settings-loading"><span class="spinner"></span><p>Loading local connector configuration…</p></div>`
-    : `<form id="connector-settings-form"><section class="adapter-grid"><label><span>World model</span><select name="worldModelAdapter"><option value="openrouter" ${settings.worldModelAdapter === "openrouter" ? "selected" : ""}>OpenRouter</option><option value="simulated" ${settings.worldModelAdapter === "simulated" ? "selected" : ""}>Simulated</option></select></label><label><span>Jev engine</span><select name="jevAdapter"><option value="typesafe" ${settings.jevAdapter === "typesafe" ? "selected" : ""}>TypeSafe Jev</option><option value="simulated" ${settings.jevAdapter === "simulated" ? "selected" : ""}>Simulated</option></select></label><label><span>Execution broker</span><select name="brokerAdapter"><option value="ctrader-fix" ${settings.brokerAdapter === "ctrader-fix" ? "selected" : ""}>cTrader FIX</option><option value="simulated" ${settings.brokerAdapter === "simulated" ? "selected" : ""}>Simulated</option></select></label></section><div class="connector-sections">${settings.sections.map((section) => `<section class="connector-section"><header><div><h3>${escapeHtml(section.title)}</h3><p>${escapeHtml(section.description)}</p></div><span>${section.fields.filter((field) => field.configured).length}/${section.fields.length} set</span></header><div class="connector-fields">${section.fields.map((field) => `<label class="connector-field"><span>${escapeHtml(field.label)}${field.required ? `<em>required</em>` : ""}</span><div><input name="${escapeHtml(field.key)}" type="${field.kind === "secret" ? "password" : "text"}" value="${escapeHtml(field.value)}" placeholder="${escapeHtml(field.placeholder)}" autocomplete="off" spellcheck="false"/><i data-configured="${field.configured}">${field.configured ? "Stored" : "Not set"}</i></div></label>`).join("")}</div></section>`).join("")}</div><footer class="settings-actions"><p>Settings remain on this computer in the project’s local configuration. Connector changes apply after restarting the app.</p><div><button class="secondary-button" id="cancel-settings" type="button">Cancel</button><button class="primary-button" type="submit" ${state.settingsSaving ? "disabled" : ""}>${state.settingsSaving ? "Saving…" : "Save settings"}</button></div></footer></form>`;
-  return `<div class="settings-backdrop" id="settings-backdrop"><section class="settings-dialog" role="dialog" aria-modal="true" aria-labelledby="settings-title"><header class="settings-header"><div><h2 id="settings-title">API keys & connectors</h2><p>Configure the model, context, price, and execution connections used by this harness.</p></div><button class="icon-button" id="close-settings" type="button" title="Close">${icons.close}</button></header><div class="settings-update"><div><strong>Espeon updates</strong><span>${escapeHtml(updateStatus?.message ?? "Checks automatically on launch and every six hours.")}</span></div><button class="secondary-button" id="check-updates" type="button" ${updateChecking ? "disabled" : ""}>${updateChecking ? "Checking…" : "Check now"}</button></div><div class="settings-scroll">${content}</div></section></div>`;
+  const pages: { id: string; label: string; title: string; description: string; sections?: string[] }[] = [
+    { id: "overview", label: "Overview", title: "Connection overview", description: "Choose the providers Espeon uses for models, Jev, and execution." },
+    { id: "models", label: "AI models", title: "AI models", description: "Configure the world model and independent Jev decision engine.", sections: ["world-model", "jev"] },
+    { id: "market", label: "Market data", title: "Market data", description: "Set up optional historical and live price data providers.", sections: ["twelve-data"] },
+    { id: "ctrader", label: "cTrader", title: "cTrader connection", description: "Configure the read-only cTrader MCP connection and account metadata." , sections: ["ctrader-mcp"] },
+    { id: "execution", label: "Execution & risk", title: "Execution & risk", description: "Review live order readiness and configure FIX price and trade sessions.", sections: ["fix-common", "fix-price", "fix-trade"] },
+    { id: "reviews", label: "Autonomous reviews", title: "Autonomous reviews", description: "Configure review triggers, escalation, and loop limits.", sections: ["autonomous-review"] },
+    { id: "updates", label: "App updates", title: "App updates", description: "Check for Espeon updates and configure private release access.", sections: ["updates"] },
+  ];
+  const page = pages.find((item) => item.id === settingsPage) ?? pages[0];
+  const adapterPanel = !settings ? `<div class="settings-loading"><span class="spinner"></span><p>Loading local connector configuration…</p></div>` : `<section class="settings-adapters"><label><span>World model</span><select name="worldModelAdapter"><option value="openrouter" ${settings.worldModelAdapter === "openrouter" ? "selected" : ""}>OpenRouter</option><option value="simulated" ${settings.worldModelAdapter === "simulated" ? "selected" : ""}>Simulated</option></select></label><label><span>Jev engine</span><select name="jevAdapter"><option value="typesafe" ${settings.jevAdapter === "typesafe" ? "selected" : ""}>TypeSafe Jev</option><option value="simulated" ${settings.jevAdapter === "simulated" ? "selected" : ""}>Simulated</option></select></label><label><span>Execution broker</span><select name="brokerAdapter"><option value="ctrader-fix" ${settings.brokerAdapter === "ctrader-fix" ? "selected" : ""}>cTrader FIX</option><option value="simulated" ${settings.brokerAdapter === "simulated" ? "selected" : ""}>Simulated</option></select></label><p>Provider choices apply after restarting Espeon.</p></section>`;
+  const sections = settings && page.sections ? settings.sections.filter((section) => page.sections?.includes(section.id)).map((section) => `<section class="connector-section"><header><div>${section.title === page.title ? "" : `<h3>${escapeHtml(section.title)}</h3>`}<p>${escapeHtml(section.description)}</p></div><span>${section.fields.filter((field) => field.configured).length}/${section.fields.length} set</span></header><div class="connector-fields">${section.fields.map((field) => `<label class="connector-field"><span>${escapeHtml(field.label)}${field.required ? `<em>required</em>` : ""}</span><div><input name="${escapeHtml(field.key)}" type="${field.kind === "secret" ? "password" : "text"}" value="${escapeHtml(field.value)}" placeholder="${escapeHtml(field.placeholder)}" autocomplete="off" spellcheck="false"/><i data-configured="${field.configured}">${field.configured ? "Stored" : "Not set"}</i></div></label>`).join("")}</div></section>`).join("") : "";
+  const pageBody = page.id === "overview" ? adapterPanel
+    : page.id === "ctrader" ? `<div class="settings-update" data-check-state="${mcpChecking ? "checking" : mcpProbeMessage.startsWith("Connection check failed") ? "error" : mcpProbeMessage ? "result" : "idle"}"><div><strong>Connection check</strong><span role="status" aria-live="polite">${escapeHtml(mcpProbeMessage || "Check the saved local MCP endpoint and account without restarting Espeon.")}</span></div><button class="secondary-button" id="probe-mcp" type="button" ${mcpChecking ? "disabled" : ""}>${mcpChecking ? "Checking…" : "Check connection"}</button></div>${sections}`
+    : page.id === "execution" ? `${settings ? riskReadinessPanel() : ""}${sections}`
+    : page.id === "updates" ? `<div class="settings-update"><div><strong>Espeon updates</strong><span>${escapeHtml(updateStatus?.message ?? "Checks automatically on launch and every six hours.")}</span></div><button class="secondary-button" id="check-updates" type="button" ${updateChecking ? "disabled" : ""}>${updateChecking ? "Checking…" : "Check now"}</button></div>${sections}`
+    : sections;
+  const content = `<form id="connector-settings-form" class="settings-form"><div class="settings-layout"><nav class="settings-nav" aria-label="Settings categories">${pages.map((item) => `<button type="button" data-settings-page="${item.id}" class="${item.id === page.id ? "is-active" : ""}" aria-current="${item.id === page.id ? "page" : "false"}">${item.label}</button>`).join("")}</nav><div class="settings-scroll"><div class="settings-page-heading"><h3>${page.title}</h3><p>${page.description}</p></div><div class="settings-page-content">${pageBody}</div></div></div><footer class="settings-actions"><p>Settings are stored locally. Connector changes apply after restarting Espeon.</p><div><button class="secondary-button" id="cancel-settings" type="button">Cancel</button><button class="primary-button" type="submit" ${state.settingsSaving ? "disabled" : ""}>${state.settingsSaving ? "Saving…" : "Save settings"}</button></div></footer></form>`;
+  return `<div class="settings-backdrop" id="settings-backdrop"><section class="settings-dialog" role="dialog" aria-modal="true" aria-labelledby="settings-title"><header class="settings-header"><div><h2 id="settings-title">Settings</h2><p>Connect and configure Espeon’s providers.</p></div><button class="icon-button" id="close-settings" type="button" aria-label="Close settings" title="Close">${icons.close}</button></header>${content}</section></div>`;
+}
+
+function riskReadinessPanel(): string {
+  const settings = state.connectorSettings;
+  if (!settings) {
+    return `<div id="order-risk-readiness" class="settings-update" data-check-state="checking"><div><strong>Order risk gate</strong><span role="status" aria-live="polite">Loading broker risk readiness…</span></div></div>`;
+  }
+  const simulated = settings.brokerAdapter === "simulated";
+  const selected = state.selectedSnapshot;
+  const active = selected?.status === "active" && !!state.selectedRunId;
+  const fieldValue = (key: string) => settings.sections.flatMap((section) => section.fields).find((field) => field.key === key)?.value ?? "";
+  const instrument = selected?.hypotheses[0]?.instruments[0] ?? "";
+  const isDemo = fieldValue("CTRADER_MCP_ENVIRONMENT").trim().toLowerCase() === "demo";
+  const volumeControls = isDemo ? "" : `<label><span>Minimum order quantity (lots)</span><input name="volumeMinimum" type="number" min="0.000001" step="any" placeholder="0.01" required/></label><label><span>Order quantity increment (lots)</span><input name="volumeStep" type="number" min="0.000001" step="any" placeholder="0.01" required/></label>`;
+  const riskNote = isDemo
+    ? "For this one Demo cycle, Espeon may round a positive quantity below one configured step up to one step if MCP volume limits are unavailable. cTrader may still reject that quantity."
+    : "Enter the current account values from cTrader and confirm the symbol’s volume limits. These values authorize one cycle only.";
+  const confirmation = isDemo
+    ? "I verified the active Demo account and approve one Jev cycle; if needed it may use one configured quantity step."
+    : `I checked this account in cTrader and confirm these current account values and ${escapeHtml(instrument || "symbol")} volume limits.`;
+  const approval = !simulated
+    ? `<form id="human-live-risk-form" class="manual-risk-approval"><strong>Human-verify one ${isDemo ? "Demo" : "live"} decision cycle</strong><p>${riskNote}</p><div class="manual-risk-identity"><label><span>Configured cTrader account</span><input name="accountId" value="${escapeHtml(fieldValue("CTRADER_MCP_ACCOUNT_ID"))}" readonly/></label><label><span>Environment</span><input name="environment" value="${escapeHtml(fieldValue("CTRADER_MCP_ENVIRONMENT"))}" readonly/></label><label><span>Active instrument</span><input name="instrument" value="${escapeHtml(instrument)}" readonly/></label></div><div class="manual-risk-grid"><label><span>Account equity</span><input name="equity" type="number" min="0.000001" step="any" required/></label><label><span>Free margin</span><input name="freeMargin" type="number" min="0" step="any" required/></label><label><span>Deposit currency</span><input name="depositCurrency" type="text" maxlength="8" placeholder="EUR" required/></label><label><span>Total open exposure</span><input name="accountOpenExposure" type="number" min="0" step="any" required/></label><label><span>${escapeHtml(instrument || "Symbol")} quote to deposit rate</span><input name="quoteToDeposit" type="number" min="0.000001" step="any" placeholder="1.0 when currencies match" required/></label>${volumeControls}</div><label class="manual-risk-confirm"><input name="confirmed" type="checkbox" required/><span>${confirmation}</span></label><button class="primary-button" type="submit" ${!active || liveRiskApprovalBusy ? "disabled" : ""}>${liveRiskApprovalBusy ? "Running one cycle…" : "Verify values and run one cycle"}</button><span class="manual-risk-result" role="status" aria-live="polite">${escapeHtml(liveRiskApprovalMessage || (active ? "This runs one immediate Jev decision cycle; it does not lower the confidence threshold." : "Select an active run before verifying a live cycle."))}</span></form>`
+    : "";
+  return `<div id="order-risk-readiness" class="settings-update" data-check-state="${simulated ? "result" : "warning"}"><div><strong>Order risk gate</strong><span role="status" aria-live="polite">${escapeHtml(settings.riskReadiness)}</span></div></div>${approval}`;
 }
 
 function renameModal(): string {
@@ -215,21 +341,43 @@ function renameModal(): string {
 }
 
 function render(): void {
+  const activeSettingsInput = document.activeElement instanceof HTMLInputElement
+    && document.activeElement.closest("#connector-settings-form")
+    ? document.activeElement
+    : null;
+  const activeSettingsName = activeSettingsInput?.name ?? null;
+  const activeSettingsSelection = activeSettingsInput && activeSettingsInput.type !== "password"
+    ? [activeSettingsInput.selectionStart, activeSettingsInput.selectionEnd] as const
+    : null;
+  const settingsScrollTop = document.querySelector<HTMLElement>(".settings-scroll")?.scrollTop ?? 0;
   document.documentElement.dataset.theme = preferences.theme;
   document.documentElement.classList.toggle("is-tauri", harnessService.isDesktop);
   document.documentElement.style.setProperty("--sidebar-width", `${sidebarIsCollapsed() ? 0 : preferences.sidebarWidth}px`);
   document.documentElement.style.setProperty("--inspector-width", `${inspectorIsCollapsed() ? 0 : preferences.inspectorWidth}px`);
-  app.innerHTML = `${windowChrome()}<div class="app-shell ${sidebarIsCollapsed() ? "sidebar-collapsed" : ""} ${inspectorIsCollapsed() ? "inspector-collapsed" : ""} ${state.tab === "history" ? "history-open" : ""}">${sidebar()}${mainPanel()}${inspector()}</div>${settingsModal()}${renameModal()}`;
+  app.innerHTML = `${windowChrome()}<div class="app-shell ${state.tab === "home" ? "home-state" : ""} ${sidebarIsCollapsed() ? "sidebar-collapsed" : ""} ${inspectorIsCollapsed() ? "inspector-collapsed" : ""} ${state.tab === "history" ? "history-open" : ""}">${sidebarIsCollapsed() ? "" : `<button class="sidebar-scrim" id="sidebar-scrim" type="button" aria-label="Close navigation"></button>`}${sidebar()}${mainPanel()}${inspector()}</div>${settingsModal()}${renameModal()}`;
   renderIcons(app);
   bindInteractions();
   bindWindowChrome();
+  if (state.settingsOpen) {
+    const settingsScroll = document.querySelector<HTMLElement>(".settings-scroll");
+    if (settingsScroll) settingsScroll.scrollTop = settingsScrollTop;
+    if (activeSettingsName) {
+      const input = document.querySelector<HTMLInputElement>(`#connector-settings-form input[name="${CSS.escape(activeSettingsName)}"]`);
+      input?.focus({ preventScroll: true });
+      if (input && activeSettingsSelection?.[0] !== null && activeSettingsSelection?.[0] !== undefined && activeSettingsSelection[1] !== null) {
+        input.setSelectionRange(activeSettingsSelection[0], activeSettingsSelection[1]);
+      }
+    }
+  }
 }
 
 async function hydrate(selectRun = true): Promise<void> {
   try {
     state.workspace = await harnessService.hydrate();
     if (selectRun && !state.selectedRunId) state.selectedRunId = state.workspace.activeRuns[0]?.runId ?? state.workspace.runHistory.find((run) => !run.archived)?.runId ?? null;
-    if (state.selectedRunId && harnessService.isDesktop) await loadRun(state.selectedRunId, false);
+    if (selectRun && state.selectedRunId && harnessService.isDesktop) {
+      void loadRun(state.selectedRunId, true);
+    }
     state.notice = harnessService.isDesktop ? "Workspace restored from canonical state." : "Browser preview — launch the Tauri app to connect the Rust harness.";
     state.noticeTone = harnessService.isDesktop ? "success" : "neutral";
   } catch (error) { state.notice = `Workspace hydration failed: ${String(error)}`; state.noticeTone = "error"; }
@@ -237,9 +385,14 @@ async function hydrate(selectRun = true): Promise<void> {
 }
 
 async function loadRun(runId: string, shouldRender = true): Promise<void> {
+  if (state.selectedRunId !== runId) {
+    state.selectedSnapshot = null;
+    state.replay = null;
+    state.selectedLoopId = null;
+  }
   state.selectedRunId = runId; state.selectedEvidenceId = null;
   if (harnessService.isDesktop) {
-    try { const [replay, snapshot] = await Promise.all([harnessService.replayRun(runId), harnessService.getRunSnapshot(runId)]); state.replay = replay; state.selectedSnapshot = snapshot; const loops = state.replay.loops; if (!loops.some((loop) => loop.id === state.selectedLoopId)) state.selectedLoopId = loops[0]?.id ?? null; }
+    try { const [replay, snapshot] = await Promise.all([harnessService.replayRun(runId), harnessService.getRunSnapshot(runId)]); if (state.selectedRunId !== runId) return; state.replay = replay; state.selectedSnapshot = snapshot; const loops = state.replay.loops; if (!loops.some((loop) => loop.id === state.selectedLoopId)) state.selectedLoopId = loops[0]?.id ?? null; }
     catch (error) { state.notice = `Could not replay run: ${String(error)}`; state.noticeTone = "error"; }
   }
   if (shouldRender) render();
@@ -248,10 +401,11 @@ async function loadRun(runId: string, shouldRender = true): Promise<void> {
 async function startRun(): Promise<void> {
   const thesis = document.querySelector<HTMLTextAreaElement>("#thesis-input")?.value.trim() ?? "";
   if (!thesis) { state.notice = "Enter a thesis or market behavior first."; state.noticeTone = "error"; render(); return; }
+  const continuationFromRunId = state.tab === "home" ? null : state.selectedRunId;
   state.loading = true; state.notice = "Starting the local autonomous run…"; state.noticeTone = "neutral"; render();
   try {
-    const snapshot = await harnessService.startRun(thesis); promptDraft = ""; await hydrate(false); state.selectedRunId = snapshot.runId; state.selectedLoopId = snapshot.loops[0]?.id ?? null; await loadRun(snapshot.runId, false); state.tab = "activity";
-    state.notice = "Autonomous run started. The harness no longer requires per-trade approval."; state.noticeTone = "success";
+    const snapshot = await harnessService.startRun(thesis, continuationFromRunId); promptDraft = ""; await hydrate(false); state.selectedRunId = snapshot.runId; state.selectedLoopId = snapshot.loops[0]?.id ?? null; await loadRun(snapshot.runId, false); state.tab = "activity";
+    state.notice = continuationFromRunId ? `Continued from ${shortId(continuationFromRunId)} in a new run. The previous run was left unchanged.` : "Autonomous run started. The harness no longer requires per-trade approval."; state.noticeTone = "success";
   } catch (error) { state.notice = String(error); state.noticeTone = "error"; }
   finally { state.loading = false; render(); }
 }
@@ -264,7 +418,7 @@ async function stopRun(): Promise<void> {
   state.noticeTone = "neutral";
   render();
   try { await harnessService.stopRun(runId); await hydrate(false); await loadRun(runId, false); state.notice = "Run stopped through the authoritative Rust harness."; state.noticeTone = "success"; }
-  catch (error) { state.notice = String(error); state.noticeTone = "error"; }
+  catch (error) { await hydrate(false); await loadRun(runId, false); state.notice = `Stop remains pending; no new entries are allowed. ${String(error)} Select Stop run again to retry closure.`; state.noticeTone = "error"; }
   finally { state.stoppingRunId = null; render(); if (updateStatus?.state === "waiting") void checkForUpdates(); }
 }
 
@@ -305,14 +459,14 @@ function closeRename(): void {
   render();
 }
 
-async function renameRun(form: HTMLFormElement): Promise<void> {
-  const runId = state.renamingRunId;
+async function renameRun(form: HTMLFormElement, runId = state.renamingRunId): Promise<void> {
   const name = String(new FormData(form).get("name") ?? "").trim();
   if (!runId || !name) return;
   try {
     await harnessService.renameRun(runId, name);
     state.workspace = await harnessService.hydrate();
     state.renamingRunId = null;
+    state.editingTitleRunId = null;
     state.notice = "Experiment renamed.";
     state.noticeTone = "success";
   } catch (error) {
@@ -333,7 +487,6 @@ async function setRunArchived(runId: string, archived: boolean): Promise<void> {
       state.selectedEvidenceId = null;
       state.replay = null;
     }
-    state.showArchived = archived;
     state.notice = archived ? "Experiment archived." : "Experiment restored.";
     state.noticeTone = "success";
   } catch (error) {
@@ -354,6 +507,8 @@ function bindResize(handleSelector: string, side: "sidebar" | "inspector"): void
 
 async function openSettings(): Promise<void> {
   state.settingsOpen = true;
+  settingsPage = "overview";
+  mcpProbeMessage = "";
   state.connectorSettings = null;
   render();
   try {
@@ -366,22 +521,82 @@ async function openSettings(): Promise<void> {
   render();
 }
 
+async function probeMcpConnection(): Promise<void> {
+  if (mcpChecking) return;
+  mcpChecking = true;
+  mcpProbeMessage = "Checking saved cTrader MCP settings…";
+  render();
+  try { mcpProbeMessage = await harnessService.probeMcpConnection(); }
+  catch (error) { mcpProbeMessage = `Connection check failed: ${String(error)}`; }
+  finally { mcpChecking = false; render(); }
+}
+
+async function approveHumanVerifiedLiveCycle(form: HTMLFormElement): Promise<void> {
+  if (liveRiskApprovalBusy) return;
+  const runId = state.selectedRunId;
+  if (!runId || !state.selectedSnapshot || state.selectedSnapshot.status !== "active") {
+    liveRiskApprovalMessage = "Select an active run before verifying a live cycle.";
+    render();
+    return;
+  }
+  const data = new FormData(form);
+  const numeric = (name: string) => Number(data.get(name));
+  const optionalNumeric = (name: string) => {
+    const value = data.get(name);
+    return value === null || value === "" ? null : Number(value);
+  };
+  liveRiskApprovalBusy = true;
+  liveRiskApprovalMessage = "Checking account identity and running one Jev cycle…";
+  render();
+  try {
+    const result = await harnessService.approveHumanVerifiedLiveCycle({
+      runId,
+      accountId: String(data.get("accountId") ?? "").trim(),
+      environment: String(data.get("environment") ?? "").trim(),
+      instrument: String(data.get("instrument") ?? "").trim(),
+      equity: numeric("equity"),
+      freeMargin: numeric("freeMargin"),
+      depositCurrency: String(data.get("depositCurrency") ?? "").trim().toUpperCase(),
+      accountOpenExposure: numeric("accountOpenExposure"),
+      quoteToDeposit: numeric("quoteToDeposit"),
+      volumeMinimum: optionalNumeric("volumeMinimum"),
+      volumeStep: optionalNumeric("volumeStep"),
+      confirmed: data.get("confirmed") === "on",
+    });
+    state.selectedSnapshot = result;
+    if (state.workspace) {
+      const index = state.workspace.activeRuns.findIndex((run) => run.runId === result.runId);
+      if (index >= 0) state.workspace.activeRuns[index] = result;
+    }
+    liveRiskApprovalMessage = "One verified cycle completed. Check Activity for its decision, risk result, and execution outcome.";
+    state.notice = liveRiskApprovalMessage;
+    state.noticeTone = "success";
+    await loadRun(result.runId, false);
+  } catch (error) {
+    liveRiskApprovalMessage = String(error);
+    state.notice = `Live cycle was not approved: ${String(error)}`;
+    state.noticeTone = "error";
+  } finally {
+    liveRiskApprovalBusy = false;
+    render();
+  }
+}
+
 function closeSettings(): void {
   if (state.settingsSaving) return;
   state.settingsOpen = false;
   render();
 }
 
-async function saveSettings(form: HTMLFormElement): Promise<void> {
-  const data = new FormData(form);
+async function saveSettings(): Promise<void> {
   const values: Record<string, string> = {};
   for (const section of state.connectorSettings?.sections ?? []) {
-    for (const field of section.fields) values[field.key] = String(data.get(field.key) ?? "").trim();
+    for (const field of section.fields) values[field.key] = field.value.trim();
   }
   const update: ConnectorSettingsUpdate = {
-    worldModelAdapter: String(data.get("worldModelAdapter") ?? "openrouter"),
-    jevAdapter: String(data.get("jevAdapter") ?? "typesafe"),
-    brokerAdapter: String(data.get("brokerAdapter") ?? "ctrader-fix"),
+    worldModelAdapter: state.connectorSettings?.worldModelAdapter ?? "openrouter",
+    jevAdapter: state.connectorSettings?.jevAdapter ?? "typesafe",
+    brokerAdapter: state.connectorSettings?.brokerAdapter ?? "ctrader-fix",
     values,
   };
   state.settingsSaving = true;
@@ -403,13 +618,8 @@ async function saveSettings(form: HTMLFormElement): Promise<void> {
 }
 
 function toggleSidebar(): void {
-  if (window.innerWidth <= 820) {
-    compactSidebarOpen = !compactSidebarOpen;
-    if (compactSidebarOpen) compactInspectorOpen = false;
-    render();
-    return;
-  }
   preferences.sidebarCollapsed = !preferences.sidebarCollapsed;
+  if (!preferences.sidebarCollapsed && window.innerWidth <= 1080) compactInspectorOpen = false;
   localStorage.setItem("jev.ui.sidebar-collapsed", String(preferences.sidebarCollapsed));
   render();
 }
@@ -417,7 +627,10 @@ function toggleSidebar(): void {
 function toggleInspector(): void {
   if (window.innerWidth <= 1080) {
     compactInspectorOpen = !compactInspectorOpen;
-    if (compactInspectorOpen) compactSidebarOpen = false;
+    if (compactInspectorOpen) {
+      preferences.sidebarCollapsed = true;
+      localStorage.setItem("jev.ui.sidebar-collapsed", "true");
+    }
     render();
     return;
   }
@@ -429,7 +642,10 @@ function toggleInspector(): void {
 function showInspector(): void {
   if (window.innerWidth <= 1080) {
     compactInspectorOpen = true;
-    if (window.innerWidth <= 820) compactSidebarOpen = false;
+  if (window.innerWidth <= 820) {
+    preferences.sidebarCollapsed = true;
+    localStorage.setItem("jev.ui.sidebar-collapsed", "true");
+  }
   }
   else preferences.inspectorCollapsed = false;
   render();
@@ -467,7 +683,75 @@ function resizePrompt(): void {
   textarea.style.overflowY = textarea.scrollHeight > height ? "auto" : "hidden";
 }
 
+let activityNavigatorResizeObserver: ResizeObserver | null = null;
+function bindActivityNavigator(): void {
+  activityNavigatorResizeObserver?.disconnect();
+  activityNavigatorResizeObserver = null;
+  const navigator = document.querySelector<HTMLElement>("#activity-navigator");
+  const track = document.querySelector<HTMLElement>(".activity-navigator-track");
+  const scroller = document.querySelector<HTMLElement>("#workbench-scroll");
+  const feed = document.querySelector<HTMLElement>("#activity-feed");
+  if (!navigator || !track || !scroller || !feed) return;
+
+  const update = () => {
+    navigator.style.height = `${scroller.clientHeight}px`;
+    const marks = [...navigator.querySelectorAll<HTMLElement>(".activity-mark-row")];
+    const cards = [...feed.querySelectorAll<HTMLElement>(".activity-card[data-activity-index]")];
+    const count = marks.length;
+    const trackHeight = Math.max(0, track.clientHeight - 8);
+    const gap = 15;
+    const compactHeight = Math.max(0, (count - 1) * gap);
+    const distribution = count <= 1 ? 0 : Math.min(1, Math.max(0, (count - 18) / 12));
+    const compactOffset = Math.max(0, (trackHeight - compactHeight) / 2);
+    marks.forEach((row, index) => {
+      const compactTop = compactOffset + index * gap;
+      const distributedTop = 4 + index / Math.max(1, count - 1) * trackHeight;
+      const top = compactTop + (distributedTop - compactTop) * distribution;
+      row.style.top = `${top}px`;
+      row.style.transform = "translateY(-50%)";
+    });
+    const scrollerTop = scroller.getBoundingClientRect().top;
+    const visible = cards.findIndex(card => card.getBoundingClientRect().bottom > scrollerTop + 12);
+    const activeIndex = visible < 0 ? Math.max(0, cards.length - 1) : visible;
+    marks.forEach((row, index) => {
+      const mark = row.querySelector<HTMLElement>(".activity-mark");
+      if (index === activeIndex) mark?.setAttribute("aria-current", "true");
+      else mark?.removeAttribute("aria-current");
+    });
+    navigator.setAttribute("aria-label", count ? `Activity navigator. Event ${activeIndex + 1} of ${count} is in view. Select a marker or use arrow keys to jump through events.` : "Activity navigator. No events.");
+  };
+  const jumpTo = (target: HTMLElement) => {
+    const top = target.getBoundingClientRect().top - scroller.getBoundingClientRect().top + scroller.scrollTop;
+    scroller.scrollTo({ top: Math.max(0, top - 8), behavior: "smooth" });
+  };
+  navigator.addEventListener("click", (event) => {
+    const mark = (event.target as HTMLElement).closest<HTMLElement>(".activity-mark");
+    const target = mark && feed.querySelector<HTMLElement>(`.activity-card[data-activity-index="${CSS.escape(mark.dataset.activityIndex ?? "")}"]`);
+    if (target) jumpTo(target);
+  });
+  navigator.addEventListener("keydown", (event) => {
+    const cards = [...feed.querySelectorAll<HTMLElement>(".activity-card[data-activity-index]")];
+    if (!cards.length) return;
+    const top = scroller.getBoundingClientRect().top;
+    let current = cards.reduce((best, card, index) => Math.abs(card.getBoundingClientRect().top - top) < Math.abs(cards[best].getBoundingClientRect().top - top) ? index : best, 0);
+    if (event.key === "ArrowDown" || event.key === "PageDown") current = Math.min(cards.length - 1, current + (event.key === "PageDown" ? 8 : 1));
+    else if (event.key === "ArrowUp" || event.key === "PageUp") current = Math.max(0, current - (event.key === "PageUp" ? 8 : 1));
+    else if (event.key === "Home") current = 0;
+    else if (event.key === "End") current = cards.length - 1;
+    else return;
+    event.preventDefault();
+    jumpTo(cards[current]);
+  });
+  scroller.addEventListener("scroll", update, { passive: true });
+  activityNavigatorResizeObserver = new ResizeObserver(update);
+  activityNavigatorResizeObserver.observe(scroller);
+  activityNavigatorResizeObserver.observe(track);
+  activityNavigatorResizeObserver.observe(feed);
+  requestAnimationFrame(update);
+}
+
 function bindInteractions(): void {
+  bindActivityNavigator();
   const prompt = document.querySelector<HTMLTextAreaElement>("#thesis-input");
   prompt?.addEventListener("input", () => { promptDraft = prompt.value; resizePrompt(); });
   resizePrompt();
@@ -480,7 +764,20 @@ function bindInteractions(): void {
   document.querySelector("#workspace-search")?.addEventListener("submit", (event) => { event.preventDefault(); void search((event.currentTarget as HTMLFormElement).querySelector("input")?.value); });
   document.querySelector("#evidence-search")?.addEventListener("submit", (event) => { event.preventDefault(); void search((event.currentTarget as HTMLFormElement).querySelector("input")?.value); });
   document.querySelectorAll<HTMLElement>("[data-tab]").forEach((button) => button.addEventListener("click", () => { state.tab = button.dataset.tab as Tab; render(); }));
+  const editTitle = () => {
+    if (!state.selectedRunId) return;
+    state.editingTitleRunId = state.selectedRunId;
+    render();
+    const input = document.querySelector<HTMLInputElement>("#run-title-input");
+    input?.focus();
+    input?.select();
+  };
+  document.querySelector("#edit-run-title")?.addEventListener("click", editTitle);
+  document.querySelector("#run-title")?.addEventListener("dblclick", editTitle);
+  document.querySelector("#cancel-title-edit")?.addEventListener("click", () => { state.editingTitleRunId = null; render(); });
+  document.querySelector("#run-title-form")?.addEventListener("submit", (event) => { event.preventDefault(); void renameRun(event.currentTarget as HTMLFormElement, state.editingTitleRunId); });
   document.querySelector("#view-all-history")?.addEventListener("click", () => { state.tab = "history"; state.showArchived = false; render(); });
+  document.querySelector("#view-all-home")?.addEventListener("click", () => { state.tab = "history"; state.showArchived = false; render(); });
   document.querySelectorAll<HTMLElement>("[data-history-filter]").forEach((button) => button.addEventListener("click", () => { state.showArchived = button.dataset.historyFilter === "archived"; render(); }));
   document.querySelectorAll<HTMLElement>("[data-open-run]").forEach((button) => button.addEventListener("click", () => { state.tab = "activity"; void loadRun(button.dataset.openRun!); }));
   document.querySelectorAll<HTMLElement>("[data-rename-run]").forEach((button) => button.addEventListener("click", () => { state.renamingRunId = button.dataset.renameRun ?? null; render(); document.querySelector<HTMLInputElement>("#run-name")?.focus(); }));
@@ -495,11 +792,46 @@ function bindInteractions(): void {
   document.querySelectorAll("#open-settings, [data-open-settings]").forEach((button) => button.addEventListener("click", () => void openSettings()));
   document.querySelectorAll("#close-settings, #cancel-settings").forEach((button) => button.addEventListener("click", closeSettings));
   document.querySelector("#check-updates")?.addEventListener("click", () => void checkForUpdates());
+  document.querySelector("#probe-mcp")?.addEventListener("click", () => void probeMcpConnection());
+  document.querySelector<HTMLFormElement>("#human-live-risk-form")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    void approveHumanVerifiedLiveCycle(event.currentTarget as HTMLFormElement);
+  });
   document.querySelector("#settings-backdrop")?.addEventListener("mousedown", (event) => { if (event.target === event.currentTarget) closeSettings(); });
-  document.querySelector("#connector-settings-form")?.addEventListener("submit", (event) => { event.preventDefault(); void saveSettings(event.currentTarget as HTMLFormElement); });
+  document.querySelector("#connector-settings-form")?.addEventListener("submit", (event) => { event.preventDefault(); void saveSettings(); });
+  document.querySelectorAll<HTMLElement>("[data-settings-page]").forEach((button) => button.addEventListener("click", () => { settingsPage = button.dataset.settingsPage ?? "overview"; render(); }));
+  document.querySelectorAll<HTMLInputElement>("#connector-settings-form input[name]").forEach((input) => {
+    input.addEventListener("input", () => {
+      for (const section of state.connectorSettings?.sections ?? []) {
+        const field = section.fields.find((candidate) => candidate.key === input.name);
+        if (field) { field.value = input.value; field.configured = input.value.length > 0; break; }
+      }
+    });
+  });
+  document.querySelectorAll<HTMLSelectElement>("#connector-settings-form select").forEach((select) => {
+    select.addEventListener("change", () => {
+      if (!state.connectorSettings) return;
+      if (select.name === "worldModelAdapter") state.connectorSettings.worldModelAdapter = select.value;
+      else if (select.name === "jevAdapter") state.connectorSettings.jevAdapter = select.value;
+      else if (select.name === "brokerAdapter") {
+        state.connectorSettings.brokerAdapter = select.value;
+        const simulated = select.value === "simulated";
+        state.connectorSettings.riskReadiness = simulated
+          ? "Simulated execution uses the configured paper risk policy. No cTrader account is used."
+          : "Live entries are blocked: cTrader FIX does not provide a fresh account risk snapshot. MCP account and volume checks alone cannot approve or size a live order.";
+        const panel = document.querySelector<HTMLElement>("#order-risk-readiness");
+        if (panel) {
+          panel.dataset.checkState = simulated ? "result" : "error";
+          const message = panel.querySelector<HTMLElement>("[role=status]");
+          if (message) message.textContent = state.connectorSettings.riskReadiness;
+        }
+      }
+    });
+  });
   document.querySelector("#toggle-theme")?.addEventListener("click", () => { preferences.theme = preferences.theme === "dark" ? "light" : "dark"; localStorage.setItem("jev.ui.theme", preferences.theme); render(); });
   document.querySelector("#toggle-sidebar")?.addEventListener("click", toggleSidebar);
-  document.querySelector("#chrome-search")?.addEventListener("click", focusWorkspaceSearch);
+  document.querySelector("#sidebar-scrim")?.addEventListener("click", toggleSidebar);
+  document.querySelector("#go-home")?.addEventListener("click", () => { state.tab = "home"; state.notice = ""; render(); });
   document.querySelector("#toggle-inspector")?.addEventListener("click", toggleInspector);
   document.querySelector("#close-inspector")?.addEventListener("click", toggleInspector);
   document.querySelector("#new-run")?.addEventListener("click", startNewRun);
@@ -508,7 +840,9 @@ function bindInteractions(): void {
 
 window.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && state.renamingRunId) { event.preventDefault(); closeRename(); return; }
+  if (event.key === "Escape" && state.editingTitleRunId) { event.preventDefault(); state.editingTitleRunId = null; render(); return; }
   if (event.key === "Escape" && state.settingsOpen) { event.preventDefault(); closeSettings(); return; }
+  if (event.key === "Escape" && !sidebarIsCollapsed()) { event.preventDefault(); toggleSidebar(); return; }
   if (state.renamingRunId || state.settingsOpen) return;
   const command = event.ctrlKey || event.metaKey;
   if (command && event.key.toLowerCase() === "k") { event.preventDefault(); focusWorkspaceSearch(); }
@@ -524,7 +858,6 @@ window.addEventListener("resize", () => {
   const nextBand = window.innerWidth <= 820 ? 0 : window.innerWidth <= 1080 ? 1 : 2;
   if (nextBand === windowLayoutBand) return;
   windowLayoutBand = nextBand;
-  compactSidebarOpen = false;
   compactInspectorOpen = false;
   render();
 });
@@ -537,12 +870,41 @@ void harnessService.subscribe(
     if (snapshot.status === "active") { if (index >= 0) state.workspace.activeRuns[index] = snapshot; else state.workspace.activeRuns.unshift(snapshot); }
     else if (index >= 0) state.workspace.activeRuns.splice(index, 1);
     if (state.selectedRunId === snapshot.runId) { state.selectedSnapshot = snapshot; await loadRun(snapshot.runId, false); }
+    try {
+      const latestHealth = await harnessService.marketHealth();
+      state.workspace.integrations = [...state.workspace.integrations.filter((item) => !item.id.startsWith("market-")), ...latestHealth];
+    } catch { /* Canonical activity still displays feed failures if the health view is unavailable. */ }
     render();
   },
   (error) => { state.notice = `Harness degraded: ${error.message}`; state.noticeTone = "error"; render(); },
 );
 void hydrate().then(() => {
   if (!harnessService.isDesktop) return;
+  window.setInterval(() => {
+    if (state.loading || state.settingsSaving) return;
+    void (async () => {
+      try {
+        const workspace = await harnessService.hydrate();
+        const runId = state.selectedRunId;
+        const [replay, snapshot] = runId
+          ? await Promise.all([harnessService.replayRun(runId), harnessService.getRunSnapshot(runId)])
+          : [null, null];
+        const changed = state.replay?.lastSequence !== replay?.lastSequence
+          || state.selectedSnapshot?.status !== snapshot?.status
+          || state.workspace?.activeRuns.length !== workspace.activeRuns.length
+          || JSON.stringify(state.workspace?.integrations) !== JSON.stringify(workspace.integrations);
+        state.workspace = workspace;
+        if (runId !== state.selectedRunId) return;
+        state.replay = replay;
+        state.selectedSnapshot = snapshot;
+        if (changed) render();
+      } catch (error) {
+        state.notice = `Canonical workspace refresh failed: ${String(error)}`;
+        state.noticeTone = "error";
+        render();
+      }
+    })();
+  }, 10_000);
   window.setTimeout(() => void checkForUpdates(), 5_000);
   window.setInterval(() => void checkForUpdates(), 6 * 60 * 60_000);
 });

@@ -1,19 +1,19 @@
 {
+  "autonomousReview": {
+    "consecutiveLossThreshold": 3,
+    "enabled": true,
+    "maxActiveLoops": 3,
+    "noTradeHorizonMode": "hypothesis_horizon",
+    "noTradeMaxDecisions": 20,
+    "noTradeMinDecisions": 6,
+    "periodicTradeThreshold": 10,
+    "retryAttempts": 3,
+    "retryBaseSeconds": 5,
+    "splitConfidenceThreshold": 0.8
+  },
   "brokerAdapter": "ctrader-fix",
   "jevAdapter": "typesafe",
-  "minimumConfidence": 0.65,
-  "autonomousReview": {
-    "enabled": true,
-    "noTradeHorizonMode": "hypothesis_horizon",
-    "noTradeMinDecisions": 6,
-    "noTradeMaxDecisions": 20,
-    "consecutiveLossThreshold": 3,
-    "periodicTradeThreshold": 10,
-    "maxActiveLoops": 3,
-    "splitConfidenceThreshold": 0.8,
-    "retryAttempts": 3,
-    "retryBaseSeconds": 5
-  },
+  "minimumConfidence": 0.6,
   "riskPolicy": {
     "duplicateOrderWindowSeconds": 300,
     "maxConsecutiveFailures": 3,
@@ -23,8 +23,9 @@
     "maxTotalExposureFraction": 0.8,
     "minimumOrderNotional": 25.0,
     "paperAccountCapital": 100000.0,
+    "paperAccountCurrency": "USD",
     "paperReferencePrice": 100.0,
-    "quantityStep": 0.0001,
+    "quantityStep": 0.01,
     "retryBaseSeconds": 5,
     "stopLossBasisPoints": 200
   },

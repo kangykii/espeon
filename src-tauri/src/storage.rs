@@ -311,8 +311,31 @@ impl CanonicalStore {
                BEFORE UPDATE ON canonical_context_versions BEGIN SELECT RAISE(ABORT, 'context versions are immutable'); END;
              CREATE TRIGGER IF NOT EXISTS context_versions_no_delete
                BEFORE DELETE ON canonical_context_versions BEGIN SELECT RAISE(ABORT, 'context versions are immutable'); END;
-             CREATE TRIGGER IF NOT EXISTS hypotheses_no_update
-               BEFORE UPDATE ON canonical_hypothesis_definitions BEGIN SELECT RAISE(ABORT, 'hypothesis versions are immutable'); END;
+             DROP TRIGGER IF EXISTS hypotheses_no_update;
+             CREATE TRIGGER hypotheses_no_update
+               BEFORE UPDATE ON canonical_hypothesis_definitions
+               WHEN NOT COALESCE((
+                 OLD.status = 'DRAFT'
+                 AND NEW.status IN ('ACTIVE','REJECTED')
+                 AND OLD.id IS NEW.id
+                 AND OLD.root_hypothesis_id IS NEW.root_hypothesis_id
+                 AND OLD.run_id IS NEW.run_id
+                 AND OLD.version IS NEW.version
+                 AND OLD.parent_hypothesis_id IS NEW.parent_hypothesis_id
+                 AND OLD.thesis_version_id IS NEW.thesis_version_id
+                 AND OLD.context_version_id IS NEW.context_version_id
+                 AND OLD.created_by_event_id IS NEW.created_by_event_id
+                 AND OLD.created_at IS NEW.created_at
+                 AND json_valid(OLD.definition_json)
+                 AND json_valid(NEW.definition_json)
+                 AND json_extract(OLD.definition_json, '$.status') = 'DRAFT'
+                 AND json_extract(OLD.definition_json, '$.contract.state') = 'DRAFT'
+                 AND json_extract(NEW.definition_json, '$.status') = NEW.status
+                 AND json_extract(NEW.definition_json, '$.contract.state') = NEW.status
+                 AND json_remove(OLD.definition_json, '$.status', '$.contract.state')
+                     = json_remove(NEW.definition_json, '$.status', '$.contract.state')
+               ), 0)
+               BEGIN SELECT RAISE(ABORT, 'hypothesis versions are immutable except for the DRAFT lifecycle transition'); END;
              CREATE TRIGGER IF NOT EXISTS hypotheses_no_delete
                BEFORE DELETE ON canonical_hypothesis_definitions BEGIN SELECT RAISE(ABORT, 'hypothesis versions are immutable'); END;
              CREATE TRIGGER IF NOT EXISTS hypothesis_reviews_no_update
@@ -405,6 +428,18 @@ impl CanonicalStore {
         Ok(run_ids)
     }
 
+    pub fn run_human_thesis(&self, run_id: &str) -> Result<String> {
+        let connection = self.connection.lock();
+        connection
+            .query_row(
+                "SELECT human_thesis FROM canonical_runs WHERE id=?1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .with_context(|| format!("canonical run {run_id} is missing its authoritative prompt"))
+    }
+
     pub fn record_thesis(&self, record: &ThesisVersion, event: &HarnessEvent) -> Result<i64> {
         self.transact(event, |transaction| {
             transaction.execute(
@@ -471,6 +506,12 @@ impl CanonicalStore {
         record: &HypothesisDefinition,
         event: &HarnessEvent,
     ) -> Result<i64> {
+        if record.status != "DRAFT"
+            || record.contract.as_ref().map(|contract| contract.state)
+                != Some(crate::contracts::ContractState::Draft)
+        {
+            bail!("new hypothesis records must enter canonical storage as a DRAFT contract");
+        }
         self.transact(event, |transaction| {
             transaction.execute(
                 "INSERT INTO canonical_hypothesis_definitions VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
@@ -494,6 +535,19 @@ impl CanonicalStore {
 
     pub fn spawn_loop(&self, record: &LoopView, event: &HarnessEvent) -> Result<i64> {
         self.transact(event, |transaction| {
+            let (status, definition_json): (String, String) = transaction.query_row(
+                "SELECT status,definition_json FROM canonical_hypothesis_definitions WHERE id=?1",
+                params![record.hypothesis_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ).context("loop spawn references a hypothesis absent from canonical storage")?;
+            let contract: Option<crate::contracts::HypothesisContract> =
+                serde_json::from_str::<HypothesisDefinition>(&definition_json)?.contract;
+            if status != "ACTIVE"
+                || contract.as_ref().map(|item| item.state)
+                    != Some(crate::contracts::ContractState::Active)
+            {
+                bail!("loop spawn rejected: referenced hypothesis contract is not ACTIVE");
+            }
             transaction.execute(
                 "INSERT INTO canonical_loops VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,NULL)",
                 params![
@@ -513,6 +567,52 @@ impl CanonicalStore {
                 "INSERT INTO canonical_loop_hypotheses VALUES (?1,?2,?3)",
                 params![record.id, record.hypothesis_id, event.id],
             )?;
+            Ok(())
+        })
+    }
+
+    pub fn activate_hypothesis(
+        &self,
+        record: &HypothesisDefinition,
+        event: &HarnessEvent,
+    ) -> Result<i64> {
+        if record.status != "ACTIVE"
+            || record.contract.as_ref().map(|contract| contract.state)
+                != Some(crate::contracts::ContractState::Active)
+        {
+            bail!("activation update must contain an ACTIVE contract");
+        }
+        self.transact(event, |transaction| {
+            let updated = transaction.execute(
+                "UPDATE canonical_hypothesis_definitions SET status=?2,definition_json=?3 WHERE id=?1 AND status='DRAFT'",
+                params![record.id, record.status, serde_json::to_string(record)?],
+            )?;
+            if updated != 1 {
+                bail!("contract activation requires one existing DRAFT hypothesis record");
+            }
+            Ok(())
+        })
+    }
+
+    pub fn reject_hypothesis(
+        &self,
+        record: &HypothesisDefinition,
+        event: &HarnessEvent,
+    ) -> Result<i64> {
+        if record.status != "REJECTED"
+            || record.contract.as_ref().map(|contract| contract.state)
+                != Some(crate::contracts::ContractState::Rejected)
+        {
+            bail!("rejection update must contain a REJECTED contract");
+        }
+        self.transact(event, |transaction| {
+            let updated = transaction.execute(
+                "UPDATE canonical_hypothesis_definitions SET status=?2,definition_json=?3 WHERE id=?1 AND status='DRAFT'",
+                params![record.id, record.status, serde_json::to_string(record)?],
+            )?;
+            if updated != 1 {
+                bail!("contract rejection requires one existing DRAFT hypothesis record");
+            }
             Ok(())
         })
     }
@@ -983,33 +1083,164 @@ impl CanonicalStore {
                     aggregate_type: row.get(5)?,
                     aggregate_id: row.get(6)?,
                     causation_event_id: row.get(7)?,
-                    occurred_at: parse_time(&occurred_at),
-                    payload: serde_json::from_str(&payload_json).unwrap_or_default(),
+                    occurred_at: parse_time(&occurred_at)?,
+                    payload: serde_json::from_str(&payload_json).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            9,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?,
                 },
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    pub fn recent_continuation_events(&self, run_id: &str, limit: usize) -> Result<Vec<StoredEvent>> {
+        let connection = self.connection.lock();
+        let mut statement = connection.prepare(
+            "SELECT sequence,id,run_id,loop_id,kind,aggregate_type,aggregate_id,
+                    causation_event_id,occurred_at,payload_json
+             FROM canonical_events
+             WHERE run_id=?1 AND kind IN (
+               'context_record_ingested','thesis_version_created','hypothesis_version_created',
+               'hypothesis_contract_activated','hypothesis_contract_rejected',
+               'jev1_decision_recorded','jev2_decision_recorded','order_evaluated',
+               'execution_recorded','position_opened','position_closed','trade_outcome_recorded',
+               'world_model_reviewed','world_model_stop_wrapup_recorded'
+             )
+             ORDER BY sequence DESC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![run_id, limit as i64], |row| {
+            let occurred_at: String = row.get(8)?;
+            let payload_json: String = row.get(9)?;
+            Ok(StoredEvent {
+                sequence: row.get(0)?,
+                event: HarnessEvent {
+                    id: row.get(1)?,
+                    run_id: row.get(2)?,
+                    loop_id: row.get(3)?,
+                    kind: row.get(4)?,
+                    aggregate_type: row.get(5)?,
+                    aggregate_id: row.get(6)?,
+                    causation_event_id: row.get(7)?,
+                    occurred_at: parse_time(&occurred_at)?,
+                    payload: serde_json::from_str(&payload_json).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            9,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?,
+                },
+            })
+        })?;
+        let mut events = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        events.reverse();
+        Ok(events)
+    }
+
     pub fn events_for_run(&self, run_id: &str) -> Result<Vec<EventView>> {
         Ok(self
             .stored_events(run_id)?
             .into_iter()
-            .map(|stored| EventView {
-                sequence: stored.sequence,
-                id: stored.event.id,
-                kind: stored.event.kind,
-                aggregate_type: stored.event.aggregate_type,
-                aggregate_id: stored.event.aggregate_id,
-                causation_event_id: stored.event.causation_event_id,
-                occurred_at: stored.event.occurred_at,
-                summary: stored
-                    .event
-                    .payload
-                    .get("summary")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("")
-                    .to_owned(),
+            .map(|stored| {
+                let detail = match stored.event.kind.as_str() {
+                    "live_context_resolution_failed" => stored
+                        .event
+                        .payload
+                        .get("error")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_owned),
+                    "market_service_state_changed" => stored
+                        .event
+                        .payload
+                        .get("detail")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_owned),
+                    "harness_worker_failed" => {
+                        let stage = stored
+                            .event
+                            .payload
+                            .get("stage")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("worker");
+                        stored
+                            .event
+                            .payload
+                            .get("error")
+                            .and_then(|value| value.as_str())
+                            .map(|error| format!("{stage}: {error}"))
+                    }
+                    "broker_sync_failed" => stored
+                        .event
+                        .payload
+                        .get("error")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_owned),
+                    "broker_sync_degraded" => stored
+                        .event
+                        .payload
+                        .get("reason")
+                        .or_else(|| stored.event.payload.get("error"))
+                        .and_then(|value| value.as_str())
+                        .map(str::to_owned),
+                    "live_context_resolved" => stored
+                        .event
+                        .payload
+                        .get("record")
+                        .and_then(|record| record.get("qualityState"))
+                        .and_then(|value| value.as_str())
+                        .map(str::to_owned),
+                    "order_evaluated" | "guardrail_evaluated" => {
+                        let result = stored.event.payload.get("result");
+                        let accepted = result
+                            .and_then(|value| value.get("accepted"))
+                            .and_then(serde_json::Value::as_bool);
+                        let reason = result
+                            .and_then(|value| value.get("reason"))
+                            .and_then(serde_json::Value::as_str);
+                        match (accepted, reason) {
+                            (Some(true), Some(reason)) => Some(format!("Approved: {reason}")),
+                            (Some(false), Some(reason)) => Some(format!("Rejected: {reason}")),
+                            (Some(true), None) => Some("Approved".into()),
+                            (Some(false), None) => Some("Rejected".into()),
+                            _ => None,
+                        }
+                    }
+                    "external_research_unavailable" => stored
+                        .event
+                        .payload
+                        .get("status")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_owned),
+                    "broker_context_unavailable" => stored
+                        .event
+                        .payload
+                        .get("error")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_owned),
+                    _ => None,
+                };
+                EventView {
+                    sequence: stored.sequence,
+                    id: stored.event.id,
+                    kind: stored.event.kind,
+                    aggregate_type: stored.event.aggregate_type,
+                    aggregate_id: stored.event.aggregate_id,
+                    loop_id: stored.event.loop_id,
+                    causation_event_id: stored.event.causation_event_id,
+                    occurred_at: stored.event.occurred_at,
+                    summary: stored
+                        .event
+                        .payload
+                        .get("summary")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("")
+                        .to_owned(),
+                    detail,
+                }
             })
             .collect())
     }
@@ -1031,8 +1262,8 @@ impl CanonicalStore {
                 status: row.get(1)?,
                 thesis: row.get(2)?,
                 archived: row.get::<_, i64>(5)? != 0,
-                started_at: parse_time(&started_at),
-                stopped_at: stopped_at.as_deref().map(parse_time),
+                started_at: parse_time(&started_at)?,
+                stopped_at: stopped_at.as_deref().map(parse_time).transpose()?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -1044,11 +1275,14 @@ impl CanonicalStore {
             anyhow::bail!("experiment name must be between 1 and 120 characters");
         }
         let connection = self.connection.lock();
-        let exists = connection.query_row(
-            "SELECT 1 FROM canonical_runs WHERE id=?1",
-            params![run_id],
-            |_| Ok(()),
-        ).optional()?.is_some();
+        let exists = connection
+            .query_row(
+                "SELECT 1 FROM canonical_runs WHERE id=?1",
+                params![run_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
         if !exists {
             anyhow::bail!("experiment not found");
         }
@@ -1062,13 +1296,15 @@ impl CanonicalStore {
 
     pub fn set_run_archived(&self, run_id: &str, archived: bool) -> Result<()> {
         let connection = self.connection.lock();
-        let status: Option<String> = connection.query_row(
-            "SELECT status FROM canonical_runs WHERE id=?1",
-            params![run_id],
-            |row| row.get(0),
-        ).optional()?;
+        let status: Option<String> = connection
+            .query_row(
+                "SELECT status FROM canonical_runs WHERE id=?1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .optional()?;
         match status.as_deref() {
-            Some("stopped") => {},
+            Some("stopped") => {}
             Some(_) => anyhow::bail!("stop the experiment before archiving it"),
             None => anyhow::bail!("experiment not found"),
         }
@@ -1103,8 +1339,14 @@ impl CanonicalStore {
                     aggregate_type: row.get(5)?,
                     aggregate_id: row.get(6)?,
                     causation_event_id: row.get(7)?,
-                    occurred_at: parse_time(&occurred_at),
-                    payload: serde_json::from_str(&payload_json).unwrap_or_default(),
+                    occurred_at: parse_time(&occurred_at)?,
+                    payload: serde_json::from_str(&payload_json).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            9,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?,
                 },
             })
         })?;
@@ -1206,29 +1448,96 @@ impl CanonicalStore {
 impl SearchableContext for CanonicalStore {
     fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
         let connection = self.connection.lock();
-        let mut statement = connection.prepare(
-            "SELECT id,canonical_entity_type,canonical_entity_id,canonical_event_id,text,created_at
-             FROM search_documents
-             WHERE lower(text) LIKE '%' || lower(?1) || '%'
-             ORDER BY created_at DESC LIMIT ?2",
-        )?;
-        let rows = statement.query_map(params![query, limit as i64], |row| {
-            let timestamp: String = row.get(5)?;
-            Ok(SearchHit {
-                document_id: row.get(0)?,
-                canonical_entity_type: row.get(1)?,
-                canonical_entity_id: row.get(2)?,
-                canonical_event_id: row.get(3)?,
-                text: row.get(4)?,
-                created_at: parse_time(&timestamp),
-            })
-        })?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        let mut hits = {
+            let mut statement = connection.prepare(
+                "SELECT id,canonical_entity_type,canonical_entity_id,canonical_event_id,text,created_at
+                 FROM search_documents
+                 WHERE lower(text) LIKE '%' || lower(?1) || '%'
+                 ORDER BY created_at DESC LIMIT ?2",
+            )?;
+            let rows = statement.query_map(params![query, limit as i64], |row| {
+                let timestamp: String = row.get(5)?;
+                Ok(SearchHit {
+                    document_id: row.get(0)?,
+                    canonical_entity_type: row.get(1)?,
+                    canonical_entity_id: row.get(2)?,
+                    canonical_event_id: row.get(3)?,
+                    text: row.get(4)?,
+                    created_at: parse_time(&timestamp)?,
+                })
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        // The text index is a rebuildable projection. Keep exact execution
+        // references discoverable from the immutable event log if indexing is
+        // disabled, delayed, or has been cleared.
+        if hits.len() < limit {
+            let mut statement = connection.prepare(
+                "SELECT id,payload_json FROM canonical_events
+                 WHERE kind IN ('execution_recorded','broker_position_imported')
+                 ORDER BY sequence DESC",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let query = query.trim().to_lowercase();
+            for row in rows {
+                let (event_id, payload) = row?;
+                let payload: serde_json::Value = serde_json::from_str(&payload)?;
+                let Some(record) = payload.get("record") else {
+                    continue;
+                };
+                let execution: ExecutionReceipt = serde_json::from_value(record.clone())?;
+                if hits.iter().any(|hit| {
+                    hit.canonical_entity_type == "execution"
+                        && hit.canonical_entity_id == execution.execution_id
+                }) {
+                    continue;
+                }
+                let text = format!(
+                    "Decision {} caused execution {}: {:?} {} quantity {} status {}.",
+                    execution.caused_by_decision_id,
+                    execution.execution_id,
+                    execution.action,
+                    execution.execution_kind,
+                    execution.filled_quantity,
+                    execution.status
+                );
+                if !text.to_lowercase().contains(&query) {
+                    continue;
+                }
+                hits.push(SearchHit {
+                    document_id: format!("canonical-execution:{}", execution.execution_id),
+                    canonical_entity_type: "execution".into(),
+                    canonical_entity_id: execution.execution_id,
+                    canonical_event_id: if execution.created_by_event_id.is_empty() {
+                        event_id
+                    } else {
+                        execution.created_by_event_id
+                    },
+                    text,
+                    created_at: execution.executed_at,
+                });
+                if hits.len() >= limit {
+                    break;
+                }
+            }
+        }
+        hits.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+        hits.truncate(limit);
+        Ok(hits)
     }
 }
 
-fn parse_time(value: &str) -> DateTime<Utc> {
+fn parse_time(value: &str) -> rusqlite::Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(value)
         .map(|timestamp| timestamp.with_timezone(&Utc))
-        .unwrap_or_else(|_| Utc::now())
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })
 }

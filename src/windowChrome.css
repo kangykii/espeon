@@ -79,6 +79,13 @@ html.is-tauri body { background: transparent; }
 }
 
 .window-chrome-actions { padding-left: 4px; }
+.window-chrome-separator {
+  width: 1px;
+  height: 18px;
+  flex: none;
+  margin: 0 4px;
+  background: var(--window-chrome-border);
+}
 .window-chrome-controls {
   padding-right: 4px;
   border-left: 1px solid var(--window-chrome-border);
@@ -96,7 +103,7 @@ html.is-tauri body { background: transparent; }
   background: transparent;
   color: inherit;
   cursor: pointer;
-  transition: background 150ms ease, color 150ms ease;
+  transition: background var(--motion-exit) var(--ease-exit), color var(--motion-exit) var(--ease-exit);
 }
 
 .window-chrome-action:hover,
@@ -104,6 +111,8 @@ html.is-tauri body { background: transparent; }
 .window-control:hover,
 .window-control:focus-visible {
   background: var(--window-control-hover-bg);
+  transition-duration: var(--motion-enter);
+  transition-timing-function: var(--ease-enter);
 }
 
 .window-chrome-action:disabled { cursor: default; opacity: 0.45; }
@@ -143,7 +152,10 @@ html.is-tauri body { background: transparent; }
     z-index: 30;
     display: flex;
     width: min(344px, calc(100vw - 8px));
-    box-shadow: var(--shadow);
+    border-left: 1px solid var(--line-strong);
+    background: color-mix(in srgb, var(--raised) var(--overlay-tint), transparent);
+    -webkit-backdrop-filter: blur(var(--overlay-blur));
+    backdrop-filter: blur(var(--overlay-blur));
   }
 }
 
@@ -156,6 +168,9 @@ html.is-tauri body { background: transparent; }
     z-index: 30;
     display: flex;
     width: min(292px, calc(100vw - 8px));
-    box-shadow: var(--shadow);
+    border-right: 1px solid var(--line-strong);
+    background: color-mix(in srgb, var(--sidebar) var(--overlay-tint), transparent);
+    -webkit-backdrop-filter: blur(var(--overlay-blur));
+    backdrop-filter: blur(var(--overlay-blur));
   }
 }

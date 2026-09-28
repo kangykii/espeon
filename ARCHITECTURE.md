@@ -1,121 +1,213 @@
-# AUTONOMOUS JEV TRADING HARNESS
+# Espeon Architecture
 
-## Architecture Specification
+This document maps the Espeon application as it exists in this repository. It separates the implemented desktop workbench and Rust runtime from the earlier, broader trading-harness specification retained in the design documents.
 
-### Purpose
+## At a glance
 
-The harness is a persistent autonomous trading system that starts from a human-supplied thesis, then runs hands-free until the user stops it or a deterministic system stop condition is reached. The world model is not the live trader. It interprets and tests hypotheses. Jev runs the live decision loops. Deterministic harness logic controls capital, risk, execution and logging.
+Espeon is a Windows desktop application built with Tauri 2. Its TypeScript/Vite frontend presents and controls experiments. A Rust process is the runtime authority: it owns experiment lifecycle, model and broker adapters, deterministic risk decisions, market data, persistence, replay, and retrieval orchestration. Python is used as a local subprocess for Qdrant-based semantic retrieval. The frontend does not make trading decisions or store canonical experiment state.
 
-### Core architecture
+```mermaid
+flowchart LR
+  User[User]
+  UI[TypeScript workbench\nVite / DOM rendering]
+  Bridge[Frontend service adapter\nTauri invoke and events]
+  App[Tauri Rust app\ncommands, state, run workers]
+  Controller[HarnessController\nexperiment orchestration]
+  WM[World model\nOpenRouter or simulated]
+  Jev[Jev decision engine\nTypeSafe or simulated]
+  Context[Context + market data\nFIX / Open API / simulated]
+  Risk[Deterministic risk engine\nallocation, guardrails, orders]
+  Broker[Execution broker\ncTrader FIX or simulated]
+  SQLite[(Canonical SQLite store\nevents and records)]
+  Replay[Replay and snapshots]
+  Retrieval[Rust retrieval adapter]
+  Py[Python Qdrant bridge\nFastEmbed + local Qdrant]
+  Updater[Signed updater\nprivate GitHub releases]
 
-#### 1. World model
+  User --> UI --> Bridge --> App --> Controller
+  Controller <--> WM
+  Controller <--> Jev
+  Controller <--> Context
+  Controller --> Risk --> Broker
+  Controller <--> SQLite
+  SQLite --> Replay
+  Controller <--> Retrieval --> Py
+  App --> Updater
+  App -->|snapshot / error events| Bridge --> UI
+```
 
-The world model is invoked sparsely rather than continuously. At startup it interprets the user's thesis, chooses what deterministic context should be supplied to Jev, and defines the qualitative thesis/question Jev should evaluate.
+## Repository map
 
-The world model may later wake on meaningful review events, inspect accumulated evidence and logs, critique the active hypothesis, change the thesis, change the context, or spawn a competing Jev loop. It is allowed to stray from the user's original thesis when evidence supports a better hypothesis. The original user input remains provenance, not an immutable constraint.
+| Path | Responsibility |
+| --- | --- |
+| `src/` | TypeScript UI, view state, display types, window chrome, chart rendering, and the frontend-to-Tauri service adapter. |
+| `src-tauri/src/` | Rust desktop entry point, Tauri commands, harness orchestration, domain records, ports, adapters, risk, market data, storage, retrieval, replay, settings, and updates. |
+| `src-tauri/tauri.conf.json` | Production Tauri configuration, frontend build command, NSIS installer, and updater configuration. |
+| `src-tauri/tauri.dev.conf.json` | Development-specific Tauri configuration. |
+| `config/harness.json` | Checked-in non-secret adapter, risk, runtime, and review defaults. |
+| `.env` / connector settings | Local credentials and integration settings; `.env` is ignored by Git. |
+| `runtime-harness/` | Local runtime data such as SQLite, Qdrant files, and cached retrieval models; ignored by Git. |
+| `retrieval/qdrant_local_bridge.py` | Python subprocess protocol for local embeddings and Qdrant operations. |
+| `tests/`, `src-tauri/tests/` | Python research checks and Rust integration coverage for the harness. |
+| `.github/workflows/release.yml` | Windows release build, signing, and private GitHub release publication. |
+| `runtime-btc/`, `research.py`, `actuals.py`, root docs | Adjacent/earlier research and trading materials; they are not the main Espeon desktop runtime path. |
 
-The world model does not directly trade, size positions, control capital, or bypass guardrails.
+## Runtime layers
 
-#### 2. Context + thesis
+### 1. Desktop shell and UI
 
-Each Jev loop is defined by two things.
+`src-tauri/src/main.rs` enters the library's `run()` function. Tauri creates the Windows desktop window, loads the built `dist/` frontend, registers the updater plugin, and exposes Rust commands.
 
-Context is deterministic information supplied to the loop. It can include live market data, official data feeds, selected internet or news records, historical records, recorded research, prior Jev decisions, trade logs and other indexed sources.
+The UI is TypeScript rendered into the `#app` element in `src/main.ts`. Its state is presentation state: selected run and loop, current tab, search results, notices, open panels, and a few local layout preferences. It renders workspace snapshots, events, positions, evidence, history, and inspector details received from Rust. `src/types.ts` mirrors the serialized Rust-facing shapes.
 
-Thesis is the qualitative question or proposition Jev is asked to evaluate.
+`src/services/harness.ts` centralizes Tauri `invoke` calls and event subscriptions. In a regular browser preview, hydration returns an empty/degraded placeholder; operations that require canonical runtime state are restricted to the desktop app. The UI is therefore a client of the harness, not an independent trading runtime.
 
-The world model can modify either independently. This allows live experiments such as keeping the same thesis but changing context, or keeping the same context while testing a modified thesis.
+### 2. Tauri application boundary
 
-#### 3. Jev loop
+`src-tauri/src/lib.rs` owns application initialization and command registration. It builds `AppState`, loads configuration and local services, restores active runs, and starts background workers. The registered commands cover starting/stopping runs, workspace hydration, snapshots, replay, search/retrieval/context ingestion, review, connector settings, and update checks.
 
-Each active hypothesis runs in its own Jev loop.
+Blocking harness and I/O operations are generally moved to Tauri's blocking worker pool. The app emits `harness:snapshot` when a run changes and `harness:error` when a background cycle or review fails. The frontend subscribes to those events and updates its view.
 
-Jev1 decides whether to open new risk. Its effective outcomes are LONG, SHORT or NO TRADE. A deterministic confidence gate can convert insufficient-confidence decisions into NO TRADE without Jev needing to know the rule.
+The runtime project root is selected from `ESPEON_PROJECT_ROOT`, the source checkout when its config exists, or `%LOCALAPPDATA%\\EspeonData` for an installed app without a source tree. When no user config exists, the app seeds a local config from `config/harness.json` with simulated adapters.
 
-Once a position is open, control moves to Jev2. Jev2 has only three actions: HOLD, SELL or BUY MORE.
+### 3. Harness orchestration
 
-HOLD keeps control in Jev2 and the position remains open.
+`HarnessController` in `src-tauri/src/harness.rs` coordinates one or more active runs. It uses interfaces defined in `ports.rs` so orchestration can work with live or simulated implementations. A run contains hypotheses, thesis/context versions, loops, cadences, positions, and event provenance.
 
-SELL closes the position and returns control to Jev1 to search for the next opening.
+At a high level, the cycle is:
 
-BUY MORE is a request for additional exposure. Control returns to Jev1, which independently decides whether the additional buy should be accepted.
+1. Resolve a loop's current thesis, context, market observations, and (if applicable) position state.
+2. Ask Jev for an entry decision or a position-management decision.
+3. Apply deterministic confidence and risk rules, capital allocation, order sizing, stop/risk controls, and duplicate protection.
+4. Submit an allowed request to the broker adapter and record the decision, order, execution, and resulting state.
+5. Evaluate autonomous-review triggers; when triggered, assemble canonical evidence and ask the world-model adapter to keep, modify, split, or stop a hypothesis.
+6. Publish snapshots and preserve state for restoration and replay.
 
-The loop continues until stopped. Jev does not know account capital, position sizing, capital allocation between hypotheses, or hidden guardrails. Those are irrelevant to its qualitative decision task.
+The world model formulates or reviews hypotheses; Jev makes the loop-level trading decision. Neither is the system authority for capital, order construction, risk controls, or broker execution. The deterministic Rust harness owns those boundaries.
 
-#### 4. Deterministic harness
+New and materially revised hypotheses use the typed `HypothesisContract` pipeline in `contracts.rs`: the world model returns a DRAFT proposal; the harness persists its projections, validates schema/provenance/freshness and checks each required context declaration against an executable resolver; then `activate_contract` is the only transition to ACTIVE. Unsupported required account/position context is repaired or rejected because Jev has no live resolver for those values. If supported required market context is temporarily unavailable at startup, the run remains DRAFT with a visible warm-up event, no loop/cadence, and a supervised retry that is recoverable after restart. Jev loops are materialized only after activation and a resolved context snapshot. MODIFY and SPLIT route their replacement proposal through the same activation gate. The spawn boundary and canonical storage reject hypotheses whose contract is not ACTIVE, and Jev cycle selection also fails closed for legacy hypotheses that lack an ACTIVE contract.
 
-The harness sits between Jev and the broker. It applies rules that are intentionally outside model awareness.
+The OpenRouter world model receives the concise shared authority prompt plus formulation-only guidance or event-specific review guidance as appropriate. Controlled research has its own instruction. `skills.rs` builds the runtime `availableSkills` catalog: handler-backed contract skills plus availability-filtered read-only research and cTrader context capabilities, each with an authority boundary and request channel. Contract skill invocations are typed and Rust dispatches only registered handlers; research and broker context stay on their existing allowlisted tool/request paths. The model cannot use unavailable capabilities or call arbitrary host tools.
 
-Its responsibilities include:
+### 4. Adapters and external services
 
-- capital allocation between active Jev loops;
-- position sizing and order construction;
-- confidence gates such as NO TRADE below a configured threshold;
-- stop losses and hard risk limits;
-- execution constraints and broker interaction;
-- loop lifecycle control;
-- immutable event logging.
+| Concern | Port / implementation | Configured behavior |
+| --- | --- | --- |
+| Hypothesis formation and review | `WorldModel`; `OpenRouterWorldModel` or `SimulatedWorldModel` | `worldModelAdapter` selects OpenRouter or the simulated implementation. |
+| Jev trading decisions | `JevEngine`; `TypeSafeJev` or `SimulatedJev` | `jevAdapter` selects TypeSafe or the simulated implementation. |
+| Execution | `ExecutionBroker`; cTrader FIX broker or simulated broker | `brokerAdapter` selects `ctrader-fix` or the simulated broker. |
+| Market observations | `MarketDataProvider`; hybrid cTrader provider or simulated provider | Live setup combines persistent FIX quotes and Open API completed-bar backfill; missing live config yields an unavailable provider rather than fabricated live observations. |
+| Structured context | `ContextResolver` | Resolves typed inputs for the model path; live context formulas are evaluated in Rust against validated observations. |
+| Semantic context retrieval | `ContextRetriever` / `QdrantContextPool` | Rust launches the configured local Python bridge, which uses FastEmbed and on-disk Qdrant. Retrieval is optional/degradable at startup. |
 
-The harness is the system authority. Model outputs are requests interpreted by deterministic rules, not direct broker commands.
+Adapter selection and risk/review defaults are in `config/harness.json`; credentials and connector values come from local environment/configuration. `config/secrets.example.json` and `.env.example` document setup without supplying live secrets.
 
-### Hypothesis spawning and capital splitting
+### 5. Market data and context provenance
 
-The world model can test a modified thesis or modified context by spawning another Jev loop.
+For the configured cTrader path, the Rust market-data module combines FIX price updates with Open API completed-candle history. The FIX side provides current quotes and helps form local UTC bars; Open API backfills gaps. Typed `LiveContextSpec` formulas use quote fields and completed candles. Each resolved snapshot records observation times and provenance so the decision can be inspected later.
 
-Capital is split automatically and equally across active loops unless the deterministic harness later specifies another fixed allocation policy. The Jev loops never see this capital amount.
+If required observations are absent, malformed, stale, or lack enough completed history, resolution fails and the harness skips that model call while recording the operational failure. It should not recast data unavailability as a model decision such as `NO TRADE`.
 
-Example:
+The cTrader MCP integration shown in the UI is a read-only context adapter status; it is distinct from FIX execution and market-data connections.
 
-One active loop receives 100% of available capital.
+### 6. Deterministic risk and execution
 
-Two active loops each receive 50%.
+`risk.rs` computes allowed order details and guardrail outcomes from configured policy and current canonical/broker state. The model's action and confidence are inputs to policy evaluation, not direct broker instructions. The allocator determines loop fractions; order idempotency and exposure, quantity, confidence, and stop rules are handled by deterministic code. The broker adapter performs the allowed execution/close request and returns a receipt for recording.
 
-Three active loops each receive approximately one third.
+This separation is an architectural boundary: changing model providers does not transfer execution authority to them.
 
-This makes hypothesis testing a harness-level portfolio operation rather than part of Jev reasoning.
+### 7. Canonical persistence, recovery, and replay
 
-### Memory and feedback loop
+`storage.rs` uses SQLite at `runtime-harness/harness.sqlite3` (or the configured runtime directory). It stores canonical run records, versioned thesis/context/hypothesis data, loops, decisions, orders, executions, positions, reviews, allocations, and sequenced events. A JSONL event log is also maintained by the canonical store. Runtime files are local and ignored by Git.
 
-Every meaningful event is logged: the loop identity, thesis, context used, Jev decisions and confidences, execution result, market outcome, timestamps and experiment status.
+On startup, the controller restores active runs from canonical storage and the Tauri setup restarts their background loops. Workspace hydration returns current active snapshots, run history, and integration status. `replay.rs` reconstructs an experiment from its ordered canonical events; SQLite is the source of truth for exact IDs, chronology, executions, and outcomes.
 
-Logs are then indexed back into the context pool. The world model can retrieve them later alongside live and historical sources. This creates a closed research loop:
+Qdrant is a retrieval index over context and prior evidence. It helps find relevant records but is not the canonical source of trading state. A missing local Python environment or unavailable Qdrant degrades retrieval and is reflected in integration status.
 
-human thesis -> world model -> context + thesis -> Jev trading -> logs -> indexed context -> world-model critique -> modified or competing hypothesis -> new Jev loop.
+### 8. Build and release
 
-The vector index is not the source of truth. Exact trades, timestamps, decisions and outcomes remain in structured canonical storage. Semantic indexing exists to help the world model retrieve relevant prior situations and research efficiently.
+Development uses Vite on port 1420 and `tauri dev`. A production Tauri build runs `npm run build` (`tsc` followed by Vite) and embeds `dist/` in the desktop app. Rust is built from `src-tauri/` and the configured release target is a Windows NSIS installer.
 
-### System boundaries
+The tag-triggered GitHub Actions workflow installs Node 22 dependencies with `npm ci`, installs stable Rust, builds and signs the installer, then publishes the installer, signature, and updater manifest to a private GitHub release. The desktop updater checks signed release metadata and delays installation while experiments are active. Production credentials/signing keys are GitHub secrets; users can authenticate to private update downloads with `gh` or a read-only GitHub token.
 
-The most important boundaries are:
+## Data and control flow
 
-- world model can change thesis/context and manage experiments, but cannot directly trade;
-- Jev can make qualitative trading decisions, but cannot see or control capital;
-- deterministic harness owns risk, sizing, broker execution and hidden guardrails;
-- historical logs are append-only and cannot be rewritten by the world model;
-- all retrieved context carries provenance and timestamps.
+```mermaid
+sequenceDiagram
+  actor User
+  participant UI as Espeon UI
+  participant Tauri as Tauri commands
+  participant H as Rust HarnessController
+  participant WM as World model
+  participant MD as Market/context adapters
+  participant Jev as Jev engine
+  participant Risk as Risk engine
+  participant Broker
+  participant Store as SQLite canonical store
 
-The result is a simple three-part intelligence split:
+  User->>UI: Start run with thesis
+  UI->>Tauri: start_run(thesis)
+  Tauri->>H: create run and initial hypothesis
+  H->>WM: formulate thesis / context / hypothesis
+  WM-->>H: typed HypothesisContract proposal + skill requests
+  H->>Store: persist contract projections as DRAFT
+  H->>H: validate schema, evidence, provenance, freshness, context
+  loop At most one base repair and one stronger-model repair
+    alt deterministic contract defect
+      H->>Store: record this proposal as REJECTED
+      H->>WM: request exact-defect repair
+      WM-->>H: complete replacement proposal
+      H->>Store: persist replacement as DRAFT
+      H->>H: re-run the same deterministic validator
+    end
+  end
+  alt validated, but required live context is temporarily unavailable
+    H->>UI: publish visible DRAFT warm-up state
+    H->>MD: retry required context resolution
+    MD-->>H: fresh observations + provenance
+    H->>H: re-run preflight and activation gate
+  else valid contract and required context resolved
+    H->>Store: activate validated contract
+    H->>Store: spawn Jev loop through the ACTIVE-contract gate
+  end
+  Tauri-->>UI: snapshot (ACTIVE loop or visible DRAFT warm-up)
+  Note over H,WM: MODIFY and SPLIT replacement contracts return through this same gate
+  loop Background cycles
+    H->>MD: resolve fresh market/context snapshot
+    MD-->>H: observations + provenance
+    H->>Jev: entry or position decision
+    Jev-->>H: action + confidence + rationale
+    H->>Risk: evaluate request and guardrails
+    Risk-->>H: order / rejection / stop outcome
+    H->>Broker: execute allowed request
+    Broker-->>H: execution receipt
+    H->>Store: append canonical decision and execution events
+    H-->>UI: harness:snapshot or harness:error
+  end
+```
 
-World model: hypothesis formation and critique.
+## Configuration and state locations
 
-Jev: fast live decision loop.
+- `config/harness.json`: adapter selections, confidence threshold, risk policy, runtime path, and autonomous-review defaults.
+- `.env` and connector settings: integration credentials and local operational values; secret material should remain local or in GitHub secrets.
+- `runtime-harness/`: default canonical SQLite database, event log, local Qdrant collection, and retrieval model cache.
+- `%LOCALAPPDATA%\\EspeonData`: installed-app data root when no source checkout is available.
+- `src-tauri/tauri.conf.json`: desktop packaging, frontend command, updater endpoint/key, and installer settings.
 
-Harness: deterministic control, capital, risk, execution and memory.
+## Architectural constraints
 
-### Live Jev context
+- Rust owns canonical state, experiment lifecycle, risk, allocations, orders, broker interaction, and replay.
+- TypeScript renders and requests changes through the Tauri service boundary; it must not estimate authoritative trading values.
+- Model outputs are untrusted requests interpreted by deterministic policy.
+- Canonical history and evidence provenance must support inspection and replay.
+- Semantic retrieval can enrich context but cannot replace structured canonical records.
+- Simulated adapters support local development and fallback configuration; their status must not be mistaken for live connectivity.
 
-Each hypothesis owns an immutable, typed `LiveContextSpec`. Its named fields are formula
-ASTs over current bid/ask/mid/spread and completed cTrader candles. The formula definition
-is stable for the hypothesis version; Rust reevaluates it from fresh observations before
-every Jev1 or Jev2 call.
+## Related documents
 
-The production market-data boundary combines a persistent cTrader FIX price session with
-cTrader Open API trendbar backfill. FIX quotes update the live envelope and locally formed
-UTC bars; Open API repairs startup and reconnect gaps. Partial candles never enter signal
-formulas. Every consumed quote, completed candle, formula result, timestamp and provenance
-reference is captured in an immutable `ResolvedContextSnapshot` and linked to the decision.
-
-If a required observation is missing, stale, malformed, or lacks sufficient history, the
-harness records `live_context_resolution_failed` and skips Jev. It does not translate an
-operational data failure into `NO TRADE`. Deterministic stop evaluation remains outside the
-model path and continues to use the broker price boundary.
+- `docs/phase-10-workbench.md` — UI surfaces and frontend boundary.
+- `docs/phase-9-world-model.md` — world-model review and research behavior.
+- `docs/memory-loop.md` — canonical memory and retrieval direction.
+- `docs/UPDATES.md` — private release and updater operation.
+- `config/harness.json` and `.env.example` — runtime defaults and connector setup.
+- `README.md` — development and release overview.

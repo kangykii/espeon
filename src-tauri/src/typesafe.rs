@@ -1,6 +1,7 @@
 use crate::domain::*;
 use crate::ports::JevEngine;
 use anyhow::{bail, Context, Result};
+use parking_lot::Mutex;
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -17,20 +18,7 @@ pub struct TypeSafeConfig {
 
 impl TypeSafeConfig {
     pub fn load(project_root: &std::path::Path) -> Result<Self> {
-        let env_path = project_root.join(".env");
-        let file_values: std::collections::HashMap<String, String> =
-            std::fs::read_to_string(&env_path)
-                .with_context(|| format!("read {}", env_path.display()))?
-                .lines()
-                .filter_map(|line| {
-                    let line = line.trim();
-                    if line.is_empty() || line.starts_with('#') {
-                        return None;
-                    }
-                    line.split_once('=')
-                        .map(|(name, value)| (name.trim().to_owned(), value.trim().to_owned()))
-                })
-                .collect();
+        let file_values = crate::config::env_file_values(project_root)?;
         let setting = |name: &str| {
             file_values
                 .get(name)
@@ -56,7 +44,7 @@ impl TypeSafeConfig {
 pub struct TypeSafeJev {
     client: Client,
     config: TypeSafeConfig,
-    model: String,
+    model: Mutex<Option<String>>,
 }
 
 #[derive(Deserialize)]
@@ -81,11 +69,10 @@ impl TypeSafeJev {
         let client = Client::builder()
             .timeout(Duration::from_secs(config.timeout_seconds))
             .build()?;
-        let discovered = Self::discover_model(&client, &config)?;
         Ok(Self {
             client,
             config,
-            model: discovered,
+            model: Mutex::new(None),
         })
     }
 
@@ -136,6 +123,16 @@ impl TypeSafeJev {
         instructions: &str,
         options: &[(&str, &str)],
     ) -> Result<(String, f64, JevInferenceMetadata)> {
+        let model = {
+            let mut selected = self.model.lock();
+            if selected.is_none() {
+                *selected = Some(Self::discover_model(&self.client, &self.config)?);
+            }
+            selected
+                .as_ref()
+                .expect("model discovery completed")
+                .clone()
+        };
         let criteria: BTreeMap<&str, &str> = options.iter().copied().collect();
         let mut provider_state = state.clone();
         if let Some(snapshot) = provider_state.live_context_snapshot.as_mut() {
@@ -160,7 +157,7 @@ impl TypeSafeJev {
             }
         }
         let payload = json!({
-            "model": self.model,
+            "model": model,
             "state": provider_state,
             "questions": {
                 question_id: {
@@ -170,6 +167,7 @@ impl TypeSafeJev {
                 }
             }
         });
+        crate::evidence::enforce_model_request_budget(&payload, "TypeSafe Jev")?;
         let endpoint = format!(
             "{}/v1/systemone",
             self.config.base_url.trim_end_matches('/')
@@ -259,7 +257,7 @@ impl TypeSafeJev {
             confidence,
             JevInferenceMetadata {
                 provider: "typesafe".into(),
-                requested_model: self.model.clone(),
+                requested_model: model,
                 returned_model: response.model,
                 question_id: question_id.into(),
                 answer_type: "choice".into(),
@@ -295,13 +293,11 @@ impl JevEngine for TypeSafeJev {
             &[
                 ("LONG", "Open a long position."),
                 ("SHORT", "Open a short position."),
-                ("NO TRADE", "Do not open a position."),
             ],
         )?;
         let action = match choice.as_str() {
             "LONG" => Jev1Action::Long,
             "SHORT" => Jev1Action::Short,
-            "NO TRADE" => Jev1Action::NoTrade,
             _ => unreachable!(),
         };
         Ok(Jev1Decision {
@@ -449,7 +445,7 @@ mod tests {
             json!({"models":[{"name":"jev-live-test","description":"test","release_date":"2026-09-15"}]}),
             json!({
                 "model":"jev-live-test",
-                "answers":{"entry_action":{"type":"choice","choice":"LONG","confidence":0.8,"probabilities":{"LONG":0.8,"SHORT":0.1,"NO TRADE":0.1}}},
+                "answers":{"entry_action":{"type":"choice","choice":"LONG","confidence":0.8,"probabilities":{"LONG":0.9,"SHORT":0.1}}},
                 "usage":{"input_tokens":100,"output_tokens":10}
             }),
             json!({
@@ -483,7 +479,7 @@ mod tests {
             .unwrap();
         assert!(entry_request.contains("\"LONG\""));
         assert!(entry_request.contains("\"SHORT\""));
-        assert!(entry_request.contains("\"NO TRADE\""));
+        assert!(!entry_request.contains("NO TRADE"));
         assert!(!entry_request.to_ascii_lowercase().contains("capital"));
         let management_request = requests
             .iter()
@@ -504,7 +500,7 @@ mod tests {
                 200,
                 json!({
                     "model":"jev-live-test",
-                    "answers":{"entry_action":{"type":"choice","choice":"NO TRADE","confidence":0.9,"probabilities":{"LONG":0.05,"SHORT":0.05,"NO TRADE":0.9}}},
+                    "answers":{"entry_action":{"type":"choice","choice":"LONG","confidence":0.59,"probabilities":{"LONG":0.6,"SHORT":0.4}}},
                     "usage":{"input_tokens":100,"output_tokens":10}
                 }),
             ),
@@ -520,7 +516,8 @@ mod tests {
         let decision = adapter
             .decide_entry(&state(false), "Choose the entry action.")
             .unwrap();
-        assert!(matches!(decision.action, Jev1Action::NoTrade));
+        assert!(matches!(decision.action, Jev1Action::Long));
+        assert_eq!(decision.confidence, 0.59);
         assert_eq!(requests.lock().unwrap().len(), 3);
     }
 
@@ -560,14 +557,11 @@ mod tests {
             .to_path_buf();
         let adapter = TypeSafeJev::new(TypeSafeConfig::load(&project_root).unwrap()).unwrap();
         let entry = adapter
-            .decide_entry(
-                &state(false),
-                "Choose LONG, SHORT, or NO TRADE for this test state.",
-            )
+            .decide_entry(&state(false), "Choose LONG or SHORT for this test state.")
             .unwrap();
         assert_eq!(entry.inference.provider, "typesafe");
         assert!(!entry.inference.returned_model.is_empty());
-        assert_eq!(entry.inference.probabilities.len(), 3);
+        assert_eq!(entry.inference.probabilities.len(), 2);
         let management = adapter
             .manage_position(
                 &state(true),
@@ -606,10 +600,10 @@ mod tests {
         let entry = adapter
             .decide_entry(
                 &resolved,
-                "Choose LONG, SHORT, or NO TRADE using only the compacted supplied state.",
+                "Choose LONG or SHORT using only the compacted supplied state.",
             )
             .unwrap();
         assert_eq!(entry.inference.provider, "typesafe");
-        assert_eq!(entry.inference.probabilities.len(), 3);
+        assert_eq!(entry.inference.probabilities.len(), 2);
     }
 }

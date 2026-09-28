@@ -49,9 +49,11 @@ export type EventView = {
   kind: string;
   aggregateType: string;
   aggregateId: string;
+  loopId?: string | null;
   causationEventId: string | null;
   occurredAt: string;
   summary: string;
+  detail?: string | null;
 };
 
 export type Position = {
@@ -122,6 +124,7 @@ export type ConnectorSettings = {
   worldModelAdapter: string;
   jevAdapter: string;
   brokerAdapter: string;
+  riskReadiness: string;
   sections: ConnectorSection[];
   restartRequired: boolean;
 };
@@ -158,10 +161,11 @@ export type Decision = {
     liveContextSnapshot?: {
       id: string;
       freshnessState: string;
+      qualityState?: string;
       resolvedAt: string;
       quote: { bid: number; ask: number; mid: number; spread: number; sourceTimestamp: string; receivedAt: string; provenance: string };
-      candles: Array<{ period: string; openTime: string; open: number; high: number; low: number; close: number; tickVolume: number; provenance: string }>;
-      fields: Array<{ fieldId: string; label: string; value: unknown; valueType: string; formula: Record<string, unknown>; observedAt: string; provenance: string[] }>;
+      candles: Array<{ period: string; openTime: string; open: number; high: number; low: number; close: number; tickVolume: number; providerVolume?: number | null; volumeKind?: string | null; provenance: string }>;
+      fields: Array<{ fieldId: string; label: string; value: unknown; valueType: string; formula: Record<string, unknown>; observedAt: string; provenance: string[]; sourceObservationIds?: string[] }>;
     } | null;
   };
   createdAt: string;

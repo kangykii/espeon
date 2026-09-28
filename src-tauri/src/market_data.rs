@@ -51,6 +51,7 @@ pub fn default_live_context_spec(instrument: &str) -> LiveContextSpec {
         id: Uuid::new_v4().to_string(),
         version: 1,
         instrument: instrument.to_owned(),
+        series_sources: HashMap::new(),
         fields: vec![
             LiveContextFieldSpec {
                 field_id: "current_price".into(),
@@ -153,9 +154,18 @@ pub fn requirements(spec: &LiveContextSpec) -> Result<Vec<SeriesRequirement>> {
         }
         collect_requirements(&field.expression, &mut required)?;
     }
+    for source in spec.series_sources.values() {
+        if !matches!(
+            source.as_str(),
+            "twelve-data-rest" | "ctrader-fix-price-only"
+        ) {
+            bail!("live context selected an unsupported candle source");
+        }
+    }
     Ok(required
         .into_values()
         .map(|(period, bars)| SeriesRequirement {
+            source: spec.series_sources.get(&format!("{:?}", period)).cloned(),
             period,
             bars: bars.min(1_000),
         })
@@ -320,10 +330,9 @@ pub fn resolve_snapshot(
     {
         bail!("live quote is invalid");
     }
-    let quote_age = now
-        .signed_duration_since(market.quote.received_at)
-        .num_seconds()
-        .max(0) as u64;
+    if !crate::freshness::is_not_far_future(now, market.quote.received_at) {
+        bail!("quote timestamp is in the future beyond the allowed clock skew");
+    }
     let candle_map = candle_map(&market.candles)?;
     let mut fields = Vec::with_capacity(spec.fields.len());
     for field in &spec.fields {
@@ -345,12 +354,17 @@ pub fn resolve_snapshot(
         let mut provenance = Vec::new();
         let mut observed_at = now;
         if uses_quote {
-            if quote_age > field.maximum_age_seconds {
+            // Quote freshness is independent of candle-period freshness. A
+            // model cannot make a stale quote acceptable by mixing it with a
+            // longer-period candle formula.
+            let quote_max_age_seconds = field.maximum_age_seconds.min(15);
+            if !crate::freshness::is_fresh(now, market.quote.received_at, quote_max_age_seconds) {
+                let quote_age = crate::freshness::age_seconds(now, market.quote.received_at);
                 bail!(
-                    "field {} requires a fresh quote; age={}s max={}s",
+                    "field {} requires a fresh quote; age={:.3}s max={}s",
                     field.field_id,
                     quote_age,
-                    field.maximum_age_seconds
+                    quote_max_age_seconds
                 );
             }
             observed_at = market.quote.received_at;
@@ -358,30 +372,57 @@ pub fn resolve_snapshot(
             provenance.push(market.quote.provenance.clone());
         }
         if !periods.is_empty() {
-            let used: Vec<&Candle> = market
-                .candles
-                .iter()
-                .filter(|candle| periods.contains(&candle.period))
-                .collect();
-            let latest_close = used
-                .iter()
-                .map(|candle| candle.open_time + chrono::Duration::seconds(candle.period.seconds()))
-                .max()
-                .context("formula has no completed candle observations")?;
-            let age = now.signed_duration_since(latest_close).num_seconds().max(0) as u64;
-            if age > field.maximum_age_seconds {
-                bail!(
-                    "field {} requires fresh completed candles; age={}s max={}s",
-                    field.field_id,
-                    age,
-                    field.maximum_age_seconds
+            for period in &periods {
+                let period_candles: Vec<&Candle> = market
+                    .candles
+                    .iter()
+                    .filter(|candle| &candle.period == period)
+                    .collect();
+                let latest_close = period_candles
+                    .iter()
+                    .map(|candle| {
+                        candle.open_time + chrono::Duration::seconds(candle.period.seconds())
+                    })
+                    .max()
+                    .with_context(|| {
+                        format!("formula has no completed {period:?} candle observations")
+                    })?;
+                // Mixed quote+candle formulas refresh with each new quote, so
+                // their candle inputs use the period's normal two-bar bound;
+                // maximumAgeSeconds applies to the quote/output freshness.
+                // Candle-only formulas retain the model's stricter declared
+                // freshness, capped at two bars for the selected period.
+                let candle_max_age_seconds = if uses_quote {
+                    (period.seconds().max(1) as u64).saturating_mul(2)
+                } else {
+                    field
+                        .maximum_age_seconds
+                        .min((period.seconds().max(1) as u64).saturating_mul(2))
+                };
+                if !crate::freshness::is_fresh(now, latest_close, candle_max_age_seconds) {
+                    let age = crate::freshness::age_seconds(now, latest_close);
+                    bail!(
+                        "field {} requires fresh completed candles; period={period:?} age={:.3}s max={}s",
+                        field.field_id,
+                        age,
+                        candle_max_age_seconds
+                    );
+                }
+                if !uses_quote && latest_close < observed_at {
+                    observed_at = latest_close;
+                }
+                ids.extend(period_candles.iter().map(|candle| candle.id.clone()));
+                ids.extend(
+                    period_candles
+                        .iter()
+                        .flat_map(|candle| candle.source_observation_ids.iter().cloned()),
+                );
+                provenance.extend(
+                    period_candles
+                        .iter()
+                        .map(|candle| candle.provenance.clone()),
                 );
             }
-            if !uses_quote {
-                observed_at = latest_close;
-            }
-            ids.extend(used.iter().map(|candle| candle.id.clone()));
-            provenance.extend(used.iter().map(|candle| candle.provenance.clone()));
         }
         ids.sort();
         ids.dedup();
@@ -410,6 +451,7 @@ pub fn resolve_snapshot(
         candles: market.candles,
         fields,
         freshness_state: "fresh".into(),
+        quality_state: market.quality_state,
         resolved_at: now,
         created_by_event_id: Uuid::new_v4().to_string(),
     })
@@ -453,7 +495,21 @@ fn column(candle: &Candle, name: &str) -> Result<f64> {
         "high" => Ok(candle.high),
         "low" => Ok(candle.low),
         "close" => Ok(candle.close),
-        "volume" | "tick_volume" => Ok(candle.tick_volume as f64),
+        "volume" | "provider_volume" => candle
+            .provider_volume
+            .context("provider trading volume is unavailable for this bar"),
+        "tick_volume" => {
+            if candle.volume_kind.as_deref() == Some("broker_tick_volume")
+                || candle.volume_kind.as_deref() == Some("simulated_tick_volume")
+                || (candle.volume_kind.is_none()
+                    && (candle.provenance.contains("ctrader-open-api")
+                        || candle.provenance.contains("simulated")))
+            {
+                Ok(candle.tick_volume as f64)
+            } else {
+                bail!("broker tick volume is unavailable for this bar")
+            }
+        }
         _ => bail!("unsupported candle column {name}"),
     }
 }
@@ -1082,7 +1138,7 @@ impl HybridCTraderMarketDataProvider {
                 .map(|c| c.open_time + chrono::Duration::seconds(period.seconds()));
             if cached.len() >= count
                 && latest_close
-                    .map(|t| now.signed_duration_since(t).num_seconds() <= period.seconds() * 2)
+                    .map(|t| crate::freshness::is_fresh(now, t, (period.seconds() * 2) as u64))
                     .unwrap_or(false)
             {
                 return Ok(cached
@@ -1148,6 +1204,10 @@ impl HybridCTraderMarketDataProvider {
                 low,
                 close: low + bar.delta_close.unwrap_or(0) as f64 / 100_000.0,
                 tick_volume: bar.volume.max(0) as u64,
+                provider_volume: None,
+                volume_kind: Some("broker_tick_volume".into()),
+                received_at: Some(now),
+                source_observation_ids: Vec::new(),
                 closed: true,
                 provenance: "ctrader-open-api-historical-trendbar".into(),
             });
@@ -1223,7 +1283,11 @@ impl HybridCTraderMarketDataProvider {
                 high,
                 low,
                 close: last.mid,
-                tick_volume: quotes.len() as u64,
+                tick_volume: 0,
+                provider_volume: None,
+                volume_kind: Some("unavailable".into()),
+                received_at: Some(now),
+                source_observation_ids: quotes.iter().map(|quote| quote.id.clone()).collect(),
                 closed: true,
                 provenance: "ctrader-fix-locally-aggregated-completed-bar".into(),
             });
@@ -1256,15 +1320,13 @@ impl HybridCTraderMarketDataProvider {
 impl MarketDataProvider for HybridCTraderMarketDataProvider {
     fn snapshot(&self, request: &MarketDataRequest) -> Result<MarketDataSnapshot> {
         let quote = self.quote_feed.quote(&request.instrument)?;
-        let age = Utc::now()
-            .signed_duration_since(quote.received_at)
-            .num_seconds()
-            .max(0) as u64;
+        let now = Utc::now();
         let maximum_age = request
             .quote_max_age_seconds
             .min(self.open_api.quote_max_age_seconds);
-        if age > maximum_age {
-            bail!("live FIX quote is stale: age={age}s max={maximum_age}s");
+        if !crate::freshness::is_fresh(now, quote.received_at, maximum_age) {
+            let age = crate::freshness::age_seconds(now, quote.received_at);
+            bail!("live FIX quote is stale or future dated: age={age:.3}s max={maximum_age}s");
         }
         let mut candles = Vec::new();
         for series in &request.series {
@@ -1280,6 +1342,7 @@ impl MarketDataProvider for HybridCTraderMarketDataProvider {
             quote,
             candles,
             captured_at: Utc::now(),
+            quality_state: "legacy-open-api".into(),
         })
     }
 }
@@ -1310,6 +1373,10 @@ impl Default for SimulatedMarketDataProvider {
 }
 
 impl MarketDataProvider for SimulatedMarketDataProvider {
+    fn is_simulated(&self) -> bool {
+        true
+    }
+
     fn snapshot(&self, request: &MarketDataRequest) -> Result<MarketDataSnapshot> {
         let mut sequence = self.sequence.lock();
         *sequence += 1;
@@ -1346,6 +1413,10 @@ impl MarketDataProvider for SimulatedMarketDataProvider {
                     low: base - 0.11,
                     close: base + 0.03,
                     tick_volume: 100 + (ts.rem_euclid(23) as u64),
+                    provider_volume: None,
+                    volume_kind: Some("simulated_tick_volume".into()),
+                    received_at: Some(now),
+                    source_observation_ids: Vec::new(),
                     closed: true,
                     provenance: "simulated-completed-bars".into(),
                 });
@@ -1355,6 +1426,7 @@ impl MarketDataProvider for SimulatedMarketDataProvider {
             quote,
             candles,
             captured_at: now,
+            quality_state: "simulated".into(),
         })
     }
 }
@@ -1434,6 +1506,63 @@ mod tests {
                 .to_string()
                 .contains("field bad")
         );
+    }
+
+    #[test]
+    fn mixed_quote_candle_formula_uses_source_specific_freshness() {
+        let provider = SimulatedMarketDataProvider::new();
+        let mut spec = default_live_context_spec("BTCUSD");
+        spec.fields = vec![LiveContextFieldSpec {
+            field_id: "quote_distance_from_close".into(),
+            label: "Quote distance from last close".into(),
+            value_type: LiveValueType::Number,
+            required: true,
+            maximum_age_seconds: 15,
+            expression: LiveExpression::Subtract {
+                left: Box::new(LiveExpression::CurrentMid),
+                right: Box::new(LiveExpression::Series {
+                    period: MarketDataPeriod::M15,
+                    column: "close".into(),
+                    lag: 0,
+                }),
+            },
+            description: "Fresh quote compared with the latest completed M15 close.".into(),
+        }];
+        let request = MarketDataRequest {
+            instrument: "BTCUSD".into(),
+            series: requirements(&spec).unwrap(),
+            quote_max_age_seconds: 15,
+        };
+        let mut market = provider.snapshot(&request).unwrap();
+        let candle = market.candles.first_mut().unwrap();
+        candle.open_time = Utc::now() - chrono::Duration::minutes(17);
+        assert!(resolve_snapshot("r", "l", "t", "c", &spec, market).is_ok());
+    }
+
+    #[test]
+    fn future_quote_and_candle_timestamps_are_rejected() {
+        let provider = SimulatedMarketDataProvider::new();
+        let spec = default_live_context_spec("BTCUSD");
+        let request = MarketDataRequest {
+            instrument: "BTCUSD".into(),
+            series: requirements(&spec).unwrap(),
+            quote_max_age_seconds: 15,
+        };
+
+        let mut future_quote = provider.snapshot(&request).unwrap();
+        future_quote.quote.received_at = Utc::now() + chrono::Duration::seconds(5);
+        assert!(resolve_snapshot("r", "l", "t", "c", &spec, future_quote)
+            .unwrap_err()
+            .to_string()
+            .contains("timestamp is in the future"));
+
+        let mut future_candle = provider.snapshot(&request).unwrap();
+        future_candle.candles.last_mut().unwrap().open_time =
+            Utc::now() + chrono::Duration::seconds(5);
+        assert!(resolve_snapshot("r", "l", "t", "c", &spec, future_candle)
+            .unwrap_err()
+            .to_string()
+            .contains("requires fresh completed candles"));
     }
 
     #[test]

@@ -10,13 +10,24 @@ pub fn replay_run(store: &CanonicalStore, run_id: &str) -> Result<ReplayState> {
     }
 
     let mut state = ReplayState::empty(run_id);
+    let mut seen_run_started = false;
     for stored in &events {
         if stored.event.run_id != run_id {
             bail!("event {} belongs to a different run", stored.event.id);
         }
+        if !seen_run_started && stored.event.kind != "run_started" {
+            bail!("run_started must be the first canonical run event");
+        }
         state.last_sequence = stored.sequence;
         match stored.event.kind.as_str() {
             "run_started" => {
+                if seen_run_started {
+                    bail!("run contains more than one canonical run_started event");
+                }
+                if stored.event.aggregate_type != "run" || stored.event.aggregate_id != run_id {
+                    bail!("run_started event has an invalid run aggregate identity");
+                }
+                seen_run_started = true;
                 state.status = "active".into();
                 state.human_thesis = stored
                     .event
@@ -41,7 +52,57 @@ pub fn replay_run(store: &CanonicalStore, run_id: &str) -> Result<ReplayState> {
             | "hypothesis_stopped" => state
                 .hypotheses
                 .push(record(&stored.event.payload, "hypothesis definition")?),
-            "loop_spawned" => state.loops.push(record(&stored.event.payload, "loop")?),
+            "hypothesis_contract_activated" => {
+                let hypothesis: HypothesisDefinition =
+                    record(&stored.event.payload, "activated hypothesis contract")?;
+                if hypothesis.status != "ACTIVE"
+                    || hypothesis.contract.as_ref().map(|contract| contract.state)
+                        != Some(crate::contracts::ContractState::Active)
+                {
+                    bail!(
+                        "hypothesis contract activation event did not contain an ACTIVE contract"
+                    );
+                }
+                let existing = state
+                    .hypotheses
+                    .iter_mut()
+                    .find(|item| item.id == hypothesis.id)
+                    .context("contract activation references unknown DRAFT hypothesis")?;
+                *existing = hypothesis;
+            }
+            "hypothesis_contract_rejected" => {
+                let hypothesis: HypothesisDefinition =
+                    record(&stored.event.payload, "rejected hypothesis contract")?;
+                if hypothesis.status != "REJECTED"
+                    || hypothesis.contract.as_ref().map(|contract| contract.state)
+                        != Some(crate::contracts::ContractState::Rejected)
+                {
+                    bail!(
+                        "hypothesis contract rejection event did not contain a REJECTED contract"
+                    );
+                }
+                let existing = state
+                    .hypotheses
+                    .iter_mut()
+                    .find(|item| item.id == hypothesis.id)
+                    .context("contract rejection references unknown DRAFT hypothesis")?;
+                *existing = hypothesis;
+            }
+            "loop_spawned" => {
+                let loop_state: LoopView = record(&stored.event.payload, "loop")?;
+                if state
+                    .hypotheses
+                    .iter()
+                    .find(|hypothesis| hypothesis.id == loop_state.hypothesis_id)
+                    .and_then(|hypothesis| hypothesis.contract.as_ref())
+                    .is_some_and(|contract| {
+                        contract.state != crate::contracts::ContractState::Active
+                    })
+                {
+                    bail!("loop_spawned references a non-ACTIVE hypothesis contract");
+                }
+                state.loops.push(loop_state);
+            }
             "loop_cadence_mapped" => state
                 .cadences
                 .push(record(&stored.event.payload, "loop cadence")?),
@@ -129,7 +190,7 @@ pub fn replay_run(store: &CanonicalStore, run_id: &str) -> Result<ReplayState> {
             "memory_indexed" => state
                 .memory_documents
                 .push(record(&stored.event.payload, "memory document")?),
-            "context_record_ingested" => state
+            "context_record_ingested" | "web_evidence_ingested" => state
                 .context_pool_records
                 .push(record(&stored.event.payload, "context pool record")?),
             "world_model_reviewed" | "startup_memory_review_recorded" => state
@@ -147,32 +208,76 @@ pub fn replay_run(store: &CanonicalStore, run_id: &str) -> Result<ReplayState> {
                 .autonomous_review_triggers
                 .push(record(&stored.event.payload, "autonomous review trigger")?),
             "loop_stopped" => {
-                let loop_state: LoopView = record(&stored.event.payload, "stopped loop")?;
-                let existing = state
+                let existing_index = state
                     .loops
-                    .iter_mut()
-                    .find(|existing| existing.id == loop_state.id)
+                    .iter()
+                    .position(|existing| {
+                        stored
+                            .event
+                            .payload
+                            .get("record")
+                            .and_then(|record| record.get("id"))
+                            .and_then(serde_json::Value::as_str)
+                            == Some(existing.id.as_str())
+                    })
                     .context("loop_stopped references unknown loop")?;
-                *existing = loop_state;
+                let loop_state = loop_transition_record(
+                    &stored.event.payload,
+                    &state.loops[existing_index],
+                    "stopped loop",
+                )?;
+                state.loops[existing_index] = loop_state;
             }
             "loop_state_transitioned" => {
-                let loop_state: LoopView = record(&stored.event.payload, "transitioned loop")?;
-                let existing = state
+                let existing_index = state
                     .loops
-                    .iter_mut()
-                    .find(|item| item.id == loop_state.id)
+                    .iter()
+                    .position(|item| {
+                        stored
+                            .event
+                            .payload
+                            .get("record")
+                            .and_then(|record| record.get("id"))
+                            .and_then(serde_json::Value::as_str)
+                            == Some(item.id.as_str())
+                    })
                     .context("loop_state_transitioned references unknown loop")?;
-                *existing = loop_state;
+                let loop_state = loop_transition_record(
+                    &stored.event.payload,
+                    &state.loops[existing_index],
+                    "transitioned loop",
+                )?;
+                state.loops[existing_index] = loop_state;
             }
             "run_stopped" => state.status = "stopped".into(),
             "guardrail_evaluated"
             | "jev_inference_failed"
             | "live_context_resolution_failed"
+            | "market_service_state_changed"
+            | "contract_stop_limit_triggered"
             | "broker_state_synchronized"
             | "broker_sync_failed"
-            | "broker_sync_degraded" => {}
+            | "broker_sync_degraded"
+            | "broker_context_unavailable"
+            | "external_research_unavailable"
+            | "human_live_risk_verified"
+            | "harness_worker_failed"
+            | "run_recovery_blocked"
+            | "review_recovery_aborted"
+            // Stop wrap-ups are archival-only retrospectives recorded after
+            // the run is already stopped. They do not mutate workspace state,
+            // regardless of whether the model review succeeded or failed.
+            | "world_model_stop_wrapup_recorded"
+            | "world_model_stop_wrapup_failed" => {}
             other => bail!("unsupported canonical event kind during replay: {other}"),
         }
+    }
+    if !seen_run_started {
+        bail!("run has no canonical run_started event");
+    }
+    let authoritative_thesis = store.run_human_thesis(run_id)?;
+    if state.human_thesis != authoritative_thesis {
+        bail!("run_started prompt differs from the authoritative canonical_runs prompt");
     }
     validate(&state, &events)?;
     Ok(state)
@@ -189,6 +294,31 @@ fn record<T: serde::de::DeserializeOwned>(
             .clone(),
     )
     .with_context(|| format!("decode {description} record"))
+}
+
+fn loop_transition_record(
+    payload: &serde_json::Value,
+    existing: &LoopView,
+    description: &str,
+) -> Result<LoopView> {
+    let mut value = payload
+        .get("record")
+        .with_context(|| format!("event missing {description} record"))?
+        .clone();
+    let fields = value
+        .as_object_mut()
+        .with_context(|| format!("{description} record is not an object"))?;
+    let previous = serde_json::to_value(existing)?;
+    let previous_fields = previous
+        .as_object()
+        .context("previous loop state did not serialize as an object")?;
+    // Older stop/transition records omitted fields added to LoopView later.
+    // Keep the last complete loop projection and apply the fields this event
+    // actually carried, so historical activity remains replayable.
+    for (key, fallback) in previous_fields {
+        fields.entry(key.clone()).or_insert_with(|| fallback.clone());
+    }
+    serde_json::from_value(value).with_context(|| format!("decode {description} record"))
 }
 
 fn validate(state: &ReplayState, events: &[StoredEvent]) -> Result<()> {
@@ -581,6 +711,185 @@ fn validate(state: &ReplayState, events: &[StoredEvent]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod legacy_contract_replay_tests {
+    use super::*;
+    use chrono::Utc;
+    use serde_json::json;
+
+    fn event(
+        id: &str,
+        run_id: &str,
+        kind: &str,
+        aggregate_type: &str,
+        aggregate_id: &str,
+        payload: serde_json::Value,
+    ) -> HarnessEvent {
+        HarnessEvent {
+            id: id.into(),
+            run_id: run_id.into(),
+            loop_id: None,
+            kind: kind.into(),
+            aggregate_type: aggregate_type.into(),
+            aggregate_id: aggregate_id.into(),
+            causation_event_id: None,
+            occurred_at: Utc::now(),
+            payload,
+        }
+    }
+
+    #[test]
+    fn legacy_active_hypothesis_without_contract_still_replays_for_history() {
+        let runtime = tempfile::tempdir().expect("temporary legacy replay database");
+        let store = CanonicalStore::open(runtime.path()).expect("open legacy replay database");
+        let run_id = "legacy-run";
+        let run_event = event(
+            "legacy-run-start",
+            run_id,
+            "run_started",
+            "run",
+            run_id,
+            json!({"humanThesis":"Historical BTC experiment"}),
+        );
+        store
+            .create_run(run_id, "Historical BTC experiment", &run_event)
+            .unwrap();
+
+        let now = Utc::now();
+        let thesis = ThesisVersion {
+            id: "legacy-thesis".into(),
+            run_id: run_id.into(),
+            version: 1,
+            thesis: "Historical thesis".into(),
+            provenance: "legacy".into(),
+            created_by_event_id: "legacy-thesis-event".into(),
+            created_at: now,
+        };
+        store
+            .append_event(&event(
+                "legacy-thesis-event",
+                run_id,
+                "thesis_version_created",
+                "thesis_version",
+                &thesis.id,
+                json!({"record":thesis}),
+            ))
+            .unwrap();
+        let definition = ContextDefinition {
+            id: "legacy-context-definition".into(),
+            run_id: run_id.into(),
+            name: "legacy context".into(),
+            description: "historical context".into(),
+            created_by_event_id: "legacy-context-definition-event".into(),
+            created_at: now,
+        };
+        store
+            .append_event(&event(
+                "legacy-context-definition-event",
+                run_id,
+                "context_definition_created",
+                "context_definition",
+                &definition.id,
+                json!({"record":definition}),
+            ))
+            .unwrap();
+        let context = ContextVersion {
+            id: "legacy-context".into(),
+            definition_id: definition.id.clone(),
+            run_id: run_id.into(),
+            version: 1,
+            items: Vec::new(),
+            created_by_event_id: "legacy-context-event".into(),
+            created_at: now,
+        };
+        store
+            .append_event(&event(
+                "legacy-context-event",
+                run_id,
+                "context_version_created",
+                "context_version",
+                &context.id,
+                json!({"record":context}),
+            ))
+            .unwrap();
+        let hypothesis = HypothesisDefinition {
+            id: "legacy-hypothesis".into(),
+            root_hypothesis_id: "legacy-hypothesis".into(),
+            run_id: run_id.into(),
+            version: 1,
+            parent_hypothesis_id: None,
+            original_prompt: "Historical BTC experiment".into(),
+            instruments: vec!["BTCUSD".into()],
+            strategy_mechanism: "momentum".into(),
+            timeframe: TimeframeDefinition {
+                label: "one hour".into(),
+                horizon_minutes: 60,
+                source: "legacy".into(),
+                rationale: "historical".into(),
+            },
+            deterministic_context: Vec::new(),
+            live_context_spec: None,
+            jev_question: "Historical question".into(),
+            review_rules: HypothesisReviewRules {
+                support_evidence: Vec::new(),
+                weaken_evidence: Vec::new(),
+                invalidate_evidence: Vec::new(),
+                modify_when: Vec::new(),
+                split_when: Vec::new(),
+                stop_when: Vec::new(),
+            },
+            thesis_version_id: thesis.id.clone(),
+            context_version_id: context.id.clone(),
+            status: "active".into(),
+            contract: None,
+            created_by_event_id: "legacy-hypothesis-event".into(),
+            created_at: now,
+        };
+        store
+            .append_event(&event(
+                "legacy-hypothesis-event",
+                run_id,
+                "hypothesis_version_created",
+                "hypothesis",
+                &hypothesis.id,
+                json!({"record":hypothesis}),
+            ))
+            .unwrap();
+        let loop_state = LoopView {
+            id: "legacy-loop".into(),
+            run_id: run_id.into(),
+            parent_loop_id: None,
+            parent_thesis_version_id: None,
+            hypothesis_id: "legacy-hypothesis".into(),
+            thesis_version_id: thesis.id,
+            context_version_id: context.id,
+            thesis_version: 1,
+            context_version: 1,
+            state: "stopped".into(),
+            allocated_fraction: 1.0,
+            created_by_event_id: "legacy-loop-event".into(),
+            created_at: now,
+            stopped_at: Some(now),
+        };
+        store
+            .append_event(&event(
+                "legacy-loop-event",
+                run_id,
+                "loop_spawned",
+                "loop",
+                &loop_state.id,
+                json!({"record":loop_state}),
+            ))
+            .unwrap();
+
+        let replayed =
+            replay_run(&store, run_id).expect("legacy canonical history remains replayable");
+        assert_eq!(replayed.hypotheses.len(), 1);
+        assert!(replayed.hypotheses[0].contract.is_none());
+        assert_eq!(replayed.loops.len(), 1);
+    }
 }
 
 fn require<'a>(ids: &HashSet<&'a str>, id: &str, description: &str) -> Result<()> {

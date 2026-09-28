@@ -1,12 +1,12 @@
 import {
-  Activity, Archive, ArchiveRestore, ArrowRight, ChartNoAxesColumn, ChevronDown,
+  Activity, Archive, ArchiveRestore, ArrowRight, ChartNoAxesColumn, Check, ChevronDown,
   ChevronRight, Copy, ExternalLink, FileText, GitBranch, History, Layers3,
   Maximize, Minus, Moon, PanelLeft, Pencil, Plus, Search, Settings, Square,
   Sun, X, createIcons,
 } from "lucide";
 
 const lucideIcons = {
-  Activity, Archive, ArchiveRestore, ArrowRight, ChartNoAxesColumn, ChevronDown,
+  Activity, Archive, ArchiveRestore, ArrowRight, ChartNoAxesColumn, Check, ChevronDown,
   ChevronRight, Copy, ExternalLink, FileText, GitBranch, History, Layers3,
   Maximize, Minus, Moon, PanelLeft, Pencil, Plus, Search, Settings, Square, Sun, X,
 };
@@ -36,6 +36,7 @@ export const icons = {
   restore: icon("copy"),
   close: icon("x"),
   rename: icon("pencil"),
+  check: icon("check"),
   archive: icon("archive"),
   restoreArchive: icon("archive-restore"),
 };
