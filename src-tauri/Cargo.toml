@@ -1,6 +1,6 @@
 [package]
 name = "espeon"
-version = "0.1.3"
+version = "0.1.4"
 description = "Espeon desktop trading workbench"
 edition = "2021"
 
