@@ -26,7 +26,7 @@ jobs:
         run: |
           python -m venv .venv
           .venv\Scripts\python.exe -m pip install -r requirements-retrieval.txt
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: runtime-harness/models
           key: retrieval-models-${{ hashFiles('requirements-retrieval.txt') }}
