@@ -71,10 +71,7 @@ impl McpBrokerContext {
         } else {
             endpoint.trim().to_owned()
         };
-        if !endpoint.starts_with("http://127.0.0.1:") && !endpoint.starts_with("http://localhost:")
-        {
-            bail!("read-only cTrader MCP endpoint must be local");
-        }
+        let endpoint = local_mcp_endpoint(&endpoint)?;
         let environment = required("CTRADER_MCP_ENVIRONMENT")?
             .trim()
             .to_ascii_lowercase();
@@ -85,7 +82,10 @@ impl McpBrokerContext {
             endpoint,
             account_id: required("CTRADER_MCP_ACCOUNT_ID")?.trim().to_owned(),
             environment,
-            client: Client::builder().timeout(Duration::from_secs(8)).build()?,
+            client: Client::builder()
+                .timeout(Duration::from_secs(8))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()?,
             cache: Mutex::new(HashMap::new()),
             last_success_at: Mutex::new(None),
             protocol: Mutex::new(None),
@@ -531,6 +531,26 @@ impl McpBrokerContext {
         };
         Ok((value, session))
     }
+}
+
+fn local_mcp_endpoint(endpoint: &str) -> Result<String> {
+    let url = reqwest::Url::parse(endpoint).context("CTRADER_MCP_ENDPOINT is not a valid URL")?;
+    let host = url.host_str().unwrap_or_default();
+    let local_host = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback());
+    if url.scheme() != "http"
+        || !local_host
+        || url.port().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        bail!("read-only cTrader MCP endpoint must be a local HTTP URL with an explicit port and no credentials, query, or fragment");
+    }
+    Ok(url.to_string())
 }
 
 fn load_dotenv(root: &Path) -> Result<()> {
@@ -1038,6 +1058,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn mcp_endpoint_must_parse_to_a_loopback_http_host() {
+        assert_eq!(
+            local_mcp_endpoint("http://127.0.0.1:9876/mcp/").unwrap(),
+            "http://127.0.0.1:9876/mcp/"
+        );
+        assert!(local_mcp_endpoint("http://localhost:9876/mcp/").is_ok());
+        for endpoint in [
+            "https://127.0.0.1:9876/mcp/",
+            "http://127.0.0.1:9876@attacker.example/mcp/",
+            "http://localhost:9876@attacker.example/mcp/",
+            "http://127.0.0.1.evil.example:9876/mcp/",
+            "http://user@127.0.0.1:9876/mcp/",
+            "http://127.0.0.1/mcp/",
+            "http://127.0.0.1:9876/mcp/?next=http://attacker.example/",
+            "http://127.0.0.1:9876/mcp/#fragment",
+        ] {
+            assert!(
+                local_mcp_endpoint(endpoint).is_err(),
+                "endpoint should be rejected: {endpoint}"
+            );
+        }
+    }
+
+    #[test]
     #[ignore = "requires a running cTrader local MCP server with configured account settings"]
     fn live_ctrader_mcp_read_only_account_probe() {
         let project_root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
@@ -1055,11 +1099,7 @@ mod tests {
             find_key(detail, "volumeStep"),
             find_key(detail, "volumeMinimum")
         );
-        let response = format!(
-            "connected to cTrader MCP configured account {} and symbol metadata",
-            client.account_id
-        );
-        println!("{response}");
+        println!("connected to cTrader MCP configured account and symbol metadata");
     }
 
     #[test]

@@ -5268,7 +5268,7 @@ impl HarnessController {
             self.context_pool = context_pool;
             match package_result {
                 Ok(package) => wrapups.push(package),
-                Err(error) => eprintln!("Run {run_id} stop wrap-up package unavailable: {error:#}"),
+                Err(_) => eprintln!("Run stop wrap-up package could not be prepared"),
             }
         }
         let mut active = self
@@ -5326,8 +5326,11 @@ impl HarnessController {
         self.active_runs.remove(run_id);
         self.pending_stop_wrapups.insert(run_id.into(), wrapups);
         if let Some(context_pool) = &self.context_pool {
-            if let Err(error) = context_pool.sync_pending_events(&self.store, run_id) {
-                eprintln!("Run {run_id} stopped; deferred search indexing failed: {error:#}");
+            if context_pool
+                .sync_pending_events(&self.store, run_id)
+                .is_err()
+            {
+                eprintln!("Run stopped; deferred search indexing could not be completed");
             }
         }
         Ok(RunSnapshot {
