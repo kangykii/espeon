@@ -42,6 +42,8 @@ Bug reports and integration feedback are welcome. Please use GitHub Issues for r
 
 For targeted architecture and connector feedback, start with the [community feedback discussion](https://github.com/kangykii/espeon/discussions/10). The priority areas are cTrader MCP/Open API/FIX account and symbol mapping, startup and recovery behavior, and event/evidence retrieval.
 
+**Current help wanted:** cTrader developers can [review the Open API lot metadata to FIX quantity conversion](https://github.com/kangykii/espeon/issues/11). Sanitized demo examples are welcome; never share credentials or account data.
+
 ## Releases and updates
 
 Windows installers are built and signed by GitHub Actions when a version tag is pushed. The app verifies update signatures before installation and waits while an experiment is active. Public signed releases do not need a GitHub token. See [release and signing details](docs/UPDATES.md); the updater signing private key belongs only in local secure storage and GitHub Actions secrets.
