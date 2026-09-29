@@ -47,7 +47,7 @@ sequenceDiagram
 | Active-run replay | Reconstructs active runs and pending startup DRAFT contracts before the window. It does not reconcile broker state here. | Replay or required canonical-store reads/writes can fail initialization. Work can grow with active runs and event history; there is no measured startup profile in the repository. |
 | Window/hydration | Tauri creates the window after state load. The UI then hydrates workspace and selected-run state. | Large replay/snapshot payloads or command errors can delay populated UI after the window appears. |
 
-Qdrant Python/FastEmbed initialization is no longer a pre-window blocker. Each bridge invocation has a 12-second operation limit; retrieval failure is logged/degraded and does not prevent the first window. A cold embedding-model setup can still delay retrieval availability after launch.
+Qdrant Python/FastEmbed initialization is no longer a pre-window blocker. Each bridge invocation has a 45-second startup/operation limit because each request launches Python and initializes the local embedding models. Retrieval failure is logged/degraded and does not prevent the first window. A cold embedding-model setup can still delay retrieval availability after launch.
 
 ## Run start and first-decision path
 

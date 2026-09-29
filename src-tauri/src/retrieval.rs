@@ -16,6 +16,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+const BRIDGE_OPERATION_TIMEOUT: Duration = Duration::from_secs(45);
+
 #[derive(Clone)]
 pub struct RetrievalConfig {
     pub python_path: PathBuf,
@@ -307,7 +309,10 @@ impl QdrantContextPool {
             let mut bytes = Vec::new();
             stderr.read_to_end(&mut bytes).map(|_| bytes)
         });
-        let deadline = Instant::now() + Duration::from_secs(12);
+        // Every operation starts a new Python process, which initializes the
+        // local FastEmbed models before handling the request. Include that
+        // cold process/model startup in the bounded operation window.
+        let deadline = Instant::now() + BRIDGE_OPERATION_TIMEOUT;
         let status = loop {
             if let Some(status) = child.try_wait()? {
                 break status;
@@ -315,7 +320,7 @@ impl QdrantContextPool {
             if Instant::now() >= deadline {
                 child.kill().ok();
                 child.wait().ok();
-                bail!("Qdrant bridge exceeded its 12-second operation limit");
+                bail!("Qdrant bridge exceeded its 45-second startup/operation limit");
             }
             std::thread::sleep(Duration::from_millis(50));
         };
