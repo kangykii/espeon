@@ -40,6 +40,12 @@ jobs:
         run: npm audit
       - name: Build frontend
         run: npm run build
+      - name: Warm local retrieval models
+        run: |
+          '{"action":"init"}' | .venv\Scripts\python.exe retrieval\qdrant_local_bridge.py `
+            --storage "$env:RUNNER_TEMP\espeon-qdrant-warmup" `
+            --models runtime-harness\models `
+            --collection ci_warmup
       - name: Check Rust release build
         run: cargo check --locked --manifest-path src-tauri/Cargo.toml --release
       - name: Run Rust tests

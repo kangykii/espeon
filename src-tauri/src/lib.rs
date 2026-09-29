@@ -416,9 +416,9 @@ fn integration_statuses(
             if config.broker_adapter != "ctrader-fix" {
                 "Simulated broker selected"
             } else if trade_fix {
-                "Trade credentials present; Open API discovers symbol lot size and volume limits. The one-cycle human verification panel supplies current account risk values"
+                "Open API discovers lot size and volume limits; account-validated MCP supplies fresh equity and free margin for each approved cycle"
             } else {
-                "FIX trade session not configured; live entries also require a broker risk snapshot provider"
+                "FIX trade session not configured; live entries require cTrader MCP account values and Open API symbol limits"
             },
         ),
         status(
@@ -432,7 +432,7 @@ fn integration_statuses(
             if config.broker_adapter == "simulated" {
                 "Paper risk policy is scoped to the simulated broker"
             } else {
-                "Automatic live risk snapshots are unavailable. Live entries require one human-verified cycle with account-bound equity, free margin, currency conversion, account exposure, and symbol limits"
+                "Fresh equity/free margin are fetched from account-validated MCP and symbol volume limits from Open API; the one-cycle form still asks for deposit currency, total open exposure, and quote-to-deposit conversion"
             },
         ),
     ]
@@ -1015,13 +1015,31 @@ async fn probe_mcp_connection(state: State<'_, AppState>) -> Result<String, Stri
 }
 
 #[tauri::command]
+async fn get_live_risk_account_values(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let root = state.project_root.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let client = mcp_context::McpBrokerContext::load(&root)
+            .map_err(|error| format!("load cTrader MCP settings: {error:#}"))?
+            .ok_or_else(|| "Enable cTrader MCP to fetch current account risk values".to_owned())?;
+        let (equity, free_margin, observed_at) = client
+            .live_risk_values()
+            .map_err(|error| format!("fetch current cTrader account values: {error:#}"))?;
+        Ok(serde_json::json!({
+            "equity": equity,
+            "freeMargin": free_margin,
+            "observedAt": observed_at,
+        }))
+    })
+    .await
+    .map_err(|error| format!("cTrader account-value worker failed: {error}"))?
+}
+
+#[tauri::command]
 async fn approve_human_verified_live_cycle(
     run_id: String,
     account_id: String,
     environment: String,
     instrument: String,
-    equity: f64,
-    free_margin: f64,
     deposit_currency: String,
     account_open_exposure: f64,
     quote_to_deposit: f64,
@@ -1033,6 +1051,12 @@ async fn approve_human_verified_live_cycle(
     let project_root = state.project_root.clone();
     let instrument_for_metadata = instrument.clone();
     let snapshot = tauri::async_runtime::spawn_blocking(move || {
+        let mcp = mcp_context::McpBrokerContext::load(&project_root)
+            .map_err(|error| format!("load cTrader MCP settings: {error:#}"))?
+            .ok_or_else(|| "Enable cTrader MCP to fetch current account risk values".to_owned())?;
+        let (equity, free_margin, observed_at) = mcp
+            .live_risk_values()
+            .map_err(|error| format!("fetch current cTrader account values: {error:#}"))?;
         let open_api = market_data::CTraderOpenApiConfig::load_optional(&project_root)
             .map_err(|error| format!("load cTrader Open API settings: {error:#}"))?
             .ok_or_else(|| "cTrader Open API credentials are required to discover symbol lot size and volume limits".to_string())?;
@@ -1042,18 +1066,17 @@ async fn approve_human_verified_live_cycle(
         let rules = volume_rules
             .get(&instrument_for_metadata.to_ascii_uppercase().replace(['/', '-', '_'], ""))
             .ok_or_else(|| "cTrader Open API returned no volume limits for the active instrument".to_string())?;
-        let mut risk_snapshot = ports::BrokerRiskSnapshot {
+        let risk_snapshot = ports::BrokerRiskSnapshot {
             account_id,
             environment,
             equity,
             free_margin,
             deposit_asset_id: deposit_currency.clone(),
             deposit_currency_code: deposit_currency,
-            observed_at: chrono::Utc::now(),
+            observed_at,
             account_open_exposure,
             quote_to_deposit: HashMap::from([(instrument, quote_to_deposit)]),
         };
-        risk_snapshot.observed_at = chrono::Utc::now();
         controller
             .lock()
             .run_human_verified_live_cycle(
@@ -1271,6 +1294,7 @@ pub fn run() {
             ingest_context,
             get_connector_settings,
             probe_mcp_connection,
+            get_live_risk_account_values,
             approve_human_verified_live_cycle,
             save_connector_settings
         ])

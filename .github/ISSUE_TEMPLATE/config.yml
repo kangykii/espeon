@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Setup and connector questions
+    url: https://github.com/kangykii/espeon/discussions/10
+    about: Ask setup, cTrader connector, and architecture questions in Discussions.
+  - name: Report a security vulnerability privately
+    url: https://github.com/kangykii/espeon/security/advisories/new
+    about: Do not publish credentials, account identifiers, or exploit details in an issue.

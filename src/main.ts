@@ -30,6 +30,8 @@ let mcpChecking = false;
 let mcpProbeMessage = "";
 let liveRiskApprovalBusy = false;
 let liveRiskApprovalMessage = "";
+let liveRiskAccountValues: { equity: number; freeMargin: number; observedAt: string } | null = null;
+let liveRiskAccountValuesBusy = false;
 let updateRetryTimer: number | null = null;
 const sidebarIsCollapsed = () => preferences.sidebarCollapsed;
 const inspectorIsCollapsed = () => window.innerWidth <= 1080 ? !compactInspectorOpen : preferences.inspectorCollapsed;
@@ -471,14 +473,12 @@ function riskReadinessPanel(): string {
   const fieldValue = (key: string) => settings.sections.flatMap((section) => section.fields).find((field) => field.key === key)?.value ?? "";
   const instrument = selected?.hypotheses[0]?.instruments[0] ?? "";
   const isDemo = fieldValue("CTRADER_FIX_TRADE_SENDER_COMP_ID").split(".")[0].trim().toLowerCase() === "demo";
-  const riskNote = isDemo
-    ? "Espeon reads this symbol’s lot size and allowed quantity increments from cTrader Open API. Enter the current Demo account risk values; they authorize one cycle only."
-    : "Espeon reads this symbol’s lot size and allowed quantity increments from cTrader Open API. Enter the current account risk values; they authorize one cycle only.";
+  const riskNote = "Espeon reads lot size and broker quantity limits from Open API, then fetches current equity and free margin from the account-validated cTrader MCP connection. Review the remaining portfolio values; approval lasts one cycle.";
   const confirmation = isDemo
     ? "I verified the active Demo account and approve one Jev cycle using cTrader Open API symbol limits."
     : `I checked this account in cTrader and confirm these current account values for ${escapeHtml(instrument || "the active symbol")}.`;
   const approval = !simulated
-    ? `<form id="human-live-risk-form" class="manual-risk-approval"><strong>Human-verify one ${isDemo ? "Demo" : "live"} decision cycle</strong><p>${riskNote}</p><div class="manual-risk-identity"><label><span>Configured cTrader account</span><input name="accountId" value="${escapeHtml(fieldValue("CTRADER_MCP_ACCOUNT_ID"))}" readonly/></label><label><span>Environment</span><input name="environment" value="${escapeHtml(fieldValue("CTRADER_MCP_ENVIRONMENT"))}" readonly/></label><label><span>Active instrument</span><input name="instrument" value="${escapeHtml(instrument)}" readonly/></label></div><div class="manual-risk-grid"><label><span>Account equity</span><input name="equity" type="number" min="0.000001" step="any" required/></label><label><span>Free margin</span><input name="freeMargin" type="number" min="0" step="any" required/></label><label><span>Deposit currency</span><input name="depositCurrency" type="text" maxlength="8" placeholder="EUR" required/></label><label><span>Total open exposure</span><input name="accountOpenExposure" type="number" min="0" step="any" required/></label><label><span>${escapeHtml(instrument || "Symbol")} quote to deposit rate</span><input name="quoteToDeposit" type="number" min="0.000001" step="any" placeholder="1.0 when currencies match" required/></label></div><label class="manual-risk-confirm"><input name="confirmed" type="checkbox" required/><span>${confirmation}</span></label><button class="primary-button" type="submit" ${!active || liveRiskApprovalBusy ? "disabled" : ""}>${liveRiskApprovalBusy ? "Running one cycle…" : "Verify values and run one cycle"}</button><span class="manual-risk-result" role="status" aria-live="polite">${escapeHtml(liveRiskApprovalMessage || (active ? "This runs one immediate Jev decision cycle; it does not lower the confidence threshold." : "Select an active run before verifying a live cycle."))}</span></form>`
+    ? `<form id="human-live-risk-form" class="manual-risk-approval"><strong>Human-verify one ${isDemo ? "Demo" : "live"} decision cycle</strong><p>${riskNote}</p><div class="manual-risk-identity"><label><span>Configured cTrader account</span><input name="accountId" value="${escapeHtml(fieldValue("CTRADER_MCP_ACCOUNT_ID"))}" readonly/></label><label><span>Environment</span><input name="environment" value="${escapeHtml(fieldValue("CTRADER_MCP_ENVIRONMENT"))}" readonly/></label><label><span>Active instrument</span><input name="instrument" value="${escapeHtml(instrument)}" readonly/></label></div><button class="secondary-button" id="fetch-live-risk-values" type="button" ${liveRiskAccountValuesBusy ? "disabled" : ""}>${liveRiskAccountValuesBusy ? "Fetching…" : "Fetch current equity and free margin"}</button><span id="live-risk-fetch-status" class="manual-risk-result" role="status" aria-live="polite">${liveRiskAccountValues ? `cTrader MCP snapshot fetched ${escapeHtml(new Date(liveRiskAccountValues.observedAt).toLocaleString())}.` : "Fetch a fresh account snapshot before approval."}</span><div class="manual-risk-grid"><label><span>Account equity · cTrader MCP</span><input name="equity" type="number" min="0.000001" step="any" value="${liveRiskAccountValues?.equity ?? ""}" readonly required/></label><label><span>Free margin · cTrader MCP</span><input name="freeMargin" type="number" min="0" step="any" value="${liveRiskAccountValues?.freeMargin ?? ""}" readonly required/></label><label><span>Deposit currency</span><input name="depositCurrency" type="text" maxlength="8" placeholder="EUR" required/></label><label><span>Total open exposure</span><input name="accountOpenExposure" type="number" min="0" step="any" required/></label><label><span>${escapeHtml(instrument || "Symbol")} quote to deposit rate</span><input name="quoteToDeposit" type="number" min="0.000001" step="any" placeholder="1.0 when currencies match" required/></label></div><label class="manual-risk-confirm"><input name="confirmed" type="checkbox" required/><span>${confirmation}</span></label><button class="primary-button" type="submit" ${!active || liveRiskApprovalBusy || !liveRiskAccountValues ? "disabled" : ""}>${liveRiskApprovalBusy ? "Running one cycle…" : "Verify values and run one cycle"}</button><span class="manual-risk-result" role="status" aria-live="polite">${escapeHtml(liveRiskApprovalMessage || (active ? "This runs one immediate Jev decision cycle; it does not lower the confidence threshold." : "Select an active run before verifying a live cycle."))}</span></form>`
     : "";
   return `<div id="order-risk-readiness" class="settings-update" data-check-state="${simulated ? "result" : "warning"}"><div><strong>Order risk gate</strong><span role="status" aria-live="polite">${escapeHtml(settings.riskReadiness)}</span></div></div>${approval}`;
 }
@@ -704,8 +704,6 @@ async function approveHumanVerifiedLiveCycle(form: HTMLFormElement): Promise<voi
       accountId: String(data.get("accountId") ?? "").trim(),
       environment: String(data.get("environment") ?? "").trim(),
       instrument: String(data.get("instrument") ?? "").trim(),
-      equity: numeric("equity"),
-      freeMargin: numeric("freeMargin"),
       depositCurrency: String(data.get("depositCurrency") ?? "").trim().toUpperCase(),
       accountOpenExposure: numeric("accountOpenExposure"),
       quoteToDeposit: numeric("quoteToDeposit"),
@@ -941,6 +939,35 @@ function bindInteractions(): void {
   document.querySelectorAll("#close-settings, #cancel-settings").forEach((button) => button.addEventListener("click", closeSettings));
   document.querySelector("#check-updates")?.addEventListener("click", () => void checkForUpdates());
   document.querySelector("#probe-mcp")?.addEventListener("click", () => void probeMcpConnection());
+  document.querySelector<HTMLButtonElement>("#fetch-live-risk-values")?.addEventListener("click", async () => {
+    if (liveRiskAccountValuesBusy) return;
+    liveRiskAccountValuesBusy = true;
+    const button = document.querySelector<HTMLButtonElement>("#fetch-live-risk-values");
+    const status = document.querySelector<HTMLElement>("#live-risk-fetch-status");
+    if (button) {
+      button.disabled = true;
+      button.textContent = "Fetching…";
+    }
+    if (status) status.textContent = "Fetching a fresh account-validated cTrader snapshot…";
+    try {
+      liveRiskAccountValues = await harnessService.getLiveRiskAccountValues();
+      const equity = document.querySelector<HTMLInputElement>('#human-live-risk-form input[name="equity"]');
+      const freeMargin = document.querySelector<HTMLInputElement>('#human-live-risk-form input[name="freeMargin"]');
+      if (equity) equity.value = String(liveRiskAccountValues.equity);
+      if (freeMargin) freeMargin.value = String(liveRiskAccountValues.freeMargin);
+      if (status) status.textContent = `Fresh account values fetched at ${new Date(liveRiskAccountValues.observedAt).toLocaleString()}.`;
+      const submit = document.querySelector<HTMLButtonElement>('#human-live-risk-form button[type="submit"]');
+      if (submit && state.selectedSnapshot?.status === "active" && state.selectedRunId) submit.disabled = false;
+    } catch (error) {
+      if (status) status.textContent = String(error);
+    } finally {
+      liveRiskAccountValuesBusy = false;
+      if (button) {
+        button.disabled = false;
+        button.textContent = "Refresh equity and free margin";
+      }
+    }
+  });
   document.querySelector<HTMLFormElement>("#human-live-risk-form")?.addEventListener("submit", (event) => {
     event.preventDefault();
     void approveHumanVerifiedLiveCycle(event.currentTarget as HTMLFormElement);

@@ -777,7 +777,7 @@ pub fn load_connector_settings(project_root: &Path) -> Result<ConnectorSettings>
         "Simulated execution uses the configured paper risk policy. No cTrader account is used."
             .into()
     } else {
-        "Automatic account risk snapshots are unavailable. Select an active run and use the human verification panel to enter current cTrader account values and symbol limits for one decision cycle; otherwise no live entry is submitted.".into()
+        "Fresh equity and free margin are fetched from account-validated cTrader MCP and symbol volume limits from Open API; one-cycle approval still requires deposit currency, total open exposure, and quote-to-deposit conversion.".into()
     };
     Ok(ConnectorSettings {
         world_model_adapter: config.world_model_adapter,

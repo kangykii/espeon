@@ -37,6 +37,21 @@ struct LegacySession {
 }
 
 impl McpBrokerContext {
+    /// Fetch a fresh, account-validated balance response for the one-cycle risk form.
+    pub fn live_risk_values(&self) -> Result<(f64, f64, DateTime<Utc>)> {
+        let (observed_at, balance) =
+            self.cached_call_with_timestamp("get_balance", json!({}), 0)?;
+        self.validate_account(&balance)?;
+        let equity = find_numeric_field(&balance, &["equity"])
+            .context("cTrader MCP balance response omitted equity")?;
+        let free_margin = find_numeric_field(&balance, &["freeMargin", "free_margin"])
+            .context("cTrader MCP balance response omitted free margin")?;
+        if !equity.is_finite() || equity <= 0.0 || !free_margin.is_finite() || free_margin < 0.0 {
+            bail!("cTrader MCP returned invalid equity or free margin");
+        }
+        Ok((equity, free_margin, observed_at))
+    }
+
     pub fn probe(root: &Path) -> Result<String> {
         let client = Self::load(root)?.context("cTrader MCP is disabled in connector settings")?;
         let balance = client.cached_call("get_balance", json!({}), 15)?;
@@ -530,6 +545,24 @@ impl McpBrokerContext {
             serde_json::from_str(&text).context("MCP response is not JSON")?
         };
         Ok((value, session))
+    }
+}
+
+fn find_numeric_field(value: &Value, names: &[&str]) -> Option<f64> {
+    match value {
+        Value::Object(map) => {
+            for name in names {
+                if let Some(value) = map.get(*name) {
+                    let number = value.as_f64().or_else(|| value.as_str()?.parse().ok());
+                    if number.is_some() {
+                        return number;
+                    }
+                }
+            }
+            map.values().find_map(|child| find_numeric_field(child, names))
+        }
+        Value::Array(items) => items.iter().find_map(|child| find_numeric_field(child, names)),
+        _ => None,
     }
 }
 

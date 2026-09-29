@@ -85,13 +85,16 @@ export const harnessService = {
     return invoke("probe_mcp_connection");
   },
 
+  getLiveRiskAccountValues(): Promise<{ equity: number; freeMargin: number; observedAt: string }> {
+    if (!isTauri) return Promise.reject(new Error("Live account values require the desktop application."));
+    return invoke("get_live_risk_account_values");
+  },
+
   approveHumanVerifiedLiveCycle(input: {
     runId: string;
     accountId: string;
     environment: string;
     instrument: string;
-    equity: number;
-    freeMargin: number;
     depositCurrency: string;
     accountOpenExposure: number;
     quoteToDeposit: number;
@@ -103,8 +106,6 @@ export const harnessService = {
       accountId: input.accountId,
       environment: input.environment,
       instrument: input.instrument,
-      equity: input.equity,
-      freeMargin: input.freeMargin,
       depositCurrency: input.depositCurrency,
       accountOpenExposure: input.accountOpenExposure,
       quoteToDeposit: input.quoteToDeposit,
