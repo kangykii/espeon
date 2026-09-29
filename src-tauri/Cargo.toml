@@ -19,7 +19,7 @@ parking_lot = "0.12"
 prost = "0.14"
 native-tls = "0.2"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "query", "rustls"] }
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
