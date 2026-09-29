@@ -210,6 +210,18 @@ impl CTraderFixQuoteFeed {
         }
     }
 
+    pub fn current_price(&self, instrument: &str) -> Option<f64> {
+        let quote = self
+            .latest
+            .lock()
+            .get(&normalize_symbol(instrument))
+            .cloned()?;
+        if !self.is_healthy(instrument) || !quote.mid.is_finite() || quote.mid <= 0.0 {
+            return None;
+        }
+        Some(quote.mid)
+    }
+
     pub fn wait_for_fresh_quote(
         &self,
         instrument: &str,
@@ -471,7 +483,10 @@ impl CTraderFixConfig {
             .is_some_and(|value| value.eq_ignore_ascii_case("demo"))
         {
             if let Ok(configured) = env::var("CTRADER_FIX_DEMO_FIXED_QUANTITY_MAP") {
-                for entry in configured.split(',').filter(|entry| !entry.trim().is_empty()) {
+                for entry in configured
+                    .split(',')
+                    .filter(|entry| !entry.trim().is_empty())
+                {
                     let (name, raw_quantity) = entry.split_once(':').with_context(|| {
                         format!("invalid CTRADER_FIX_DEMO_FIXED_QUANTITY_MAP entry {entry}")
                     })?;
@@ -693,6 +708,7 @@ impl FixSession {
 
 pub struct CTraderFixBroker {
     config: CTraderFixConfig,
+    quote_feed: Option<CTraderFixQuoteFeed>,
     operation_lock: Mutex<()>,
     entry_validation:
         Option<std::result::Result<crate::mcp_context::McpExecutionValidator, String>>,
@@ -706,6 +722,7 @@ impl CTraderFixBroker {
     pub fn new(config: CTraderFixConfig) -> Self {
         Self {
             config,
+            quote_feed: None,
             operation_lock: Mutex::new(()),
             entry_validation: None,
             manual_entry_limits: Mutex::new(HashMap::new()),
@@ -721,6 +738,16 @@ impl CTraderFixBroker {
     ) -> Self {
         let mut broker = Self::new(config);
         broker.entry_validation = Some(validation.map_err(|error| error.to_string()));
+        broker
+    }
+
+    pub fn with_entry_validation_and_quote_feed(
+        config: CTraderFixConfig,
+        validation: Result<crate::mcp_context::McpExecutionValidator>,
+        quote_feed: Option<CTraderFixQuoteFeed>,
+    ) -> Self {
+        let mut broker = Self::with_entry_validation(config, validation);
+        broker.quote_feed = quote_feed;
         broker
     }
 
@@ -780,9 +807,10 @@ impl CTraderFixBroker {
         if let Some(position_id) = position_id {
             fields.push(("721", position_id.into()));
         }
-        if let Some(stop) = order.stop_loss_price {
-            fields.push(("1002", stop.to_string()));
-        }
+        // cTrader's New Order Single (35=D) schema does not accept tag 1002
+        // (AbsoluteSL); it is reported on execution/position reports. Keep
+        // the stop in Espeon's PositionControlRecord, where run_cycle checks
+        // it against the live quote and closes the position when triggered.
         session.send("D", &fields)?;
         loop {
             let response = session.read_message()?;
@@ -1035,9 +1063,17 @@ impl ExecutionBroker for CTraderFixBroker {
                     step,
                 )?;
             } else if !demo_volume_grant {
-                return Err(error).context(
-                    "new FIX entries require broker volume metadata or a one-cycle Demo approval",
-                );
+                let configured_demo_quantity =
+                    self.demo_fixed_entry_quantity(&request.order.instrument);
+                let is_configured_demo_quantity =
+                    configured_demo_quantity.is_some_and(|quantity| {
+                        (request.order.quantity - quantity).abs() <= 1e-9 * quantity.abs().max(1.0)
+                    });
+                if !is_configured_demo_quantity {
+                    return Err(error).context(
+                        "new FIX entries require broker volume metadata, a one-cycle Demo approval, or the configured fixed Demo quantity",
+                    );
+                }
             }
         }
         let mut receipt = self.submit(&request.order, None)?;
@@ -1168,6 +1204,12 @@ impl ExecutionBroker for CTraderFixBroker {
 
     fn reference_price(&self, instrument: &str) -> Result<Option<f64>> {
         let _guard = self.operation_lock.lock();
+        if let Some(quote_feed) = &self.quote_feed {
+            // The app's quote channel is a long-lived FIX session. Reuse its
+            // latest healthy quote instead of opening a second concurrent
+            // session with the same SenderCompID/QUOTE qualifier.
+            return Ok(quote_feed.current_price(instrument));
+        }
         let symbol = self.symbol_id(instrument)?.to_owned();
         let mut session = self.session(&self.config.price)?;
         session.send("V", &market_data_request_fields(&symbol))?;

@@ -117,29 +117,45 @@ impl AppState {
         ) = match config.broker_adapter.as_str() {
             "ctrader-fix" => match ctrader_fix::CTraderFixConfig::load(&project_root) {
                 Ok(fix_config) => {
-                    let market_data: Arc<dyn ports::MarketDataProvider> =
-                        match market_cache::MarketContextCacheProvider::start(
-                            &runtime_path,
-                            &project_root,
-                            fix_config.clone(),
-                        ) {
-                            Ok(provider) => Arc::new(provider),
-                            Err(error) => Arc::new(market_data::UnavailableMarketDataProvider(
-                                format!("local live-context cache unavailable: {error}"),
-                            )),
+                    let quote_feed =
+                        match ctrader_fix::CTraderFixQuoteFeed::start(fix_config.clone()) {
+                            Ok(feed) => Some(feed),
+                            Err(error) => {
+                                eprintln!("cTrader FIX quote feed could not start: {error:#}");
+                                None
+                            }
                         };
-                    (
-                        Box::new(ctrader_fix::CTraderFixBroker::with_entry_validation(
-                            fix_config.clone(),
-                            fix_config.validate_mcp_identity().and_then(|_| {
-                                mcp_context::McpExecutionValidator::start(
-                                    &project_root,
-                                    ctrader_fix::CTraderFixQuoteFeed::configured_symbols(
-                                        &fix_config,
-                                    ),
-                                )
-                            }),
+                    let market_data: Arc<dyn ports::MarketDataProvider> = match quote_feed
+                        .clone()
+                        .ok_or_else(|| anyhow::anyhow!("cTrader FIX quote feed unavailable"))
+                        .and_then(|feed| {
+                            market_cache::MarketContextCacheProvider::start_with_feed(
+                                &runtime_path,
+                                &project_root,
+                                fix_config.clone(),
+                                feed,
+                            )
+                        }) {
+                        Ok(provider) => Arc::new(provider),
+                        Err(error) => Arc::new(market_data::UnavailableMarketDataProvider(
+                            format!("local live-context cache unavailable: {error}"),
                         )),
+                    };
+                    (
+                        Box::new(
+                            ctrader_fix::CTraderFixBroker::with_entry_validation_and_quote_feed(
+                                fix_config.clone(),
+                                fix_config.validate_mcp_identity().and_then(|_| {
+                                    mcp_context::McpExecutionValidator::start(
+                                        &project_root,
+                                        ctrader_fix::CTraderFixQuoteFeed::configured_symbols(
+                                            &fix_config,
+                                        ),
+                                    )
+                                }),
+                                quote_feed,
+                            ),
+                        ),
                         market_data,
                     )
                 }
@@ -259,12 +275,17 @@ fn integration_statuses(
     let mcp_enabled = env_setting(project_root, "CTRADER_MCP_ENABLED")
         .map(|value| value.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
-    let mcp_identity_configured = mcp_enabled
-        && configured(
-            project_root,
-            &["CTRADER_MCP_ACCOUNT_ID", "CTRADER_MCP_ENVIRONMENT"],
-        );
-    let volume_scale_configured = configured(project_root, &["CTRADER_FIX_MCP_VOLUME_SCALE"]);
+    let mcp_identity_configured =
+        mcp_enabled && configured(project_root, &["CTRADER_MCP_ACCOUNT_ID"]);
+    let open_api_token = configured(project_root, &["CTRADER_OPEN_API_ACCESS_TOKEN"])
+        || configured(project_root, &["CTRADER_OPEN_API_REFRESH_TOKEN"]);
+    let open_api_market_data = configured(
+        project_root,
+        &[
+            "CTRADER_OPEN_API_CLIENT_ID",
+            "CTRADER_OPEN_API_CLIENT_SECRET",
+        ],
+    ) && open_api_token;
     let price_fix = configured(
         project_root,
         &["CTRADER_FIX_PRICE_HOST", "CTRADER_FIX_PRICE_USERNAME"],
@@ -335,11 +356,25 @@ fn integration_statuses(
                 "disabled"
             },
             if mcp_identity_configured {
-                "Read-only account identity and symbol-volume checks configured; live risk values can be human-verified for one decision cycle"
+                "Read-only account identity and detected environment configured; Open API supplies symbol lot size and volume rules"
             } else if mcp_enabled {
-                "MCP account, environment, or endpoint missing"
+                "MCP account ID missing"
             } else {
-                "Read-only adapter disabled; new FIX entries are blocked"
+                "Read-only broker lookup disabled; Demo can use its configured fixed quantity"
+            },
+        ),
+        status(
+            "ctrader-open-api",
+            "cTrader Open API",
+            if open_api_market_data {
+                "configured"
+            } else {
+                "disabled"
+            },
+            if open_api_market_data {
+                "Broker candles and automatic symbol lot-size/volume metadata configured"
+            } else {
+                "Optional broker metadata source not configured; Twelve Data and FIX price fallbacks remain available"
             },
         ),
         status(
@@ -380,10 +415,8 @@ fn integration_statuses(
             },
             if config.broker_adapter != "ctrader-fix" {
                 "Simulated broker selected"
-            } else if trade_fix && mcp_identity_configured && volume_scale_configured {
-                "FIX trade session configured; automatic account-risk snapshots are unavailable, so use the one-cycle human verification panel when live account values are not returned"
             } else if trade_fix {
-                "Trade credentials present; automatic account-risk snapshots are unavailable. The one-cycle human verification panel can supply current account values and symbol limits"
+                "Trade credentials present; Open API discovers symbol lot size and volume limits. The one-cycle human verification panel supplies current account risk values"
             } else {
                 "FIX trade session not configured; live entries also require a broker risk snapshot provider"
             },
@@ -484,6 +517,26 @@ async fn start_run(
     Ok(snapshot)
 }
 
+#[tauri::command]
+async fn steer_run(
+    run_id: String,
+    instruction: String,
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<RunSnapshot, String> {
+    let controller = Arc::clone(&state.controller);
+    let snapshot = tauri::async_runtime::spawn_blocking(move || {
+        controller
+            .lock()
+            .steer_run(&run_id, &instruction)
+            .map_err(|error| format!("{error:#}"))
+    })
+    .await
+    .map_err(|error| format!("steer-run worker failed: {error}"))??;
+    emit_snapshot(&app, &snapshot);
+    Ok(snapshot)
+}
+
 fn spawn_run_loop(
     controller: Arc<Mutex<HarnessController>>,
     market_data: Arc<dyn ports::MarketDataProvider>,
@@ -524,6 +577,9 @@ fn spawn_run_loop(
         while std::time::Instant::now() < deadline {
             if cancellation.load(Ordering::SeqCst) {
                 return;
+            }
+            if controller.lock().take_immediate_cycle(&run_id) {
+                break;
             }
             thread::sleep(
                 deadline
@@ -969,14 +1025,23 @@ async fn approve_human_verified_live_cycle(
     deposit_currency: String,
     account_open_exposure: f64,
     quote_to_deposit: f64,
-    volume_minimum: Option<f64>,
-    volume_step: Option<f64>,
     confirmed: bool,
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<RunSnapshot, String> {
     let controller = Arc::clone(&state.controller);
+    let project_root = state.project_root.clone();
+    let instrument_for_metadata = instrument.clone();
     let snapshot = tauri::async_runtime::spawn_blocking(move || {
+        let open_api = market_data::CTraderOpenApiConfig::load_optional(&project_root)
+            .map_err(|error| format!("load cTrader Open API settings: {error:#}"))?
+            .ok_or_else(|| "cTrader Open API credentials are required to discover symbol lot size and volume limits".to_string())?;
+        let volume_rules = open_api
+            .volume_rules(std::slice::from_ref(&instrument_for_metadata))
+            .map_err(|error| format!("discover broker volume metadata: {error:#}"))?;
+        let rules = volume_rules
+            .get(&instrument_for_metadata.to_ascii_uppercase().replace(['/', '-', '_'], ""))
+            .ok_or_else(|| "cTrader Open API returned no volume limits for the active instrument".to_string())?;
         let mut risk_snapshot = ports::BrokerRiskSnapshot {
             account_id,
             environment,
@@ -994,8 +1059,8 @@ async fn approve_human_verified_live_cycle(
             .run_human_verified_live_cycle(
                 &run_id,
                 risk_snapshot,
-                volume_minimum,
-                volume_step,
+                Some(rules.minimum_lots),
+                Some(rules.step_lots),
                 confirmed,
             )
             .map_err(|error| format!("human-verified live cycle failed: {error:#}"))
@@ -1190,6 +1255,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             start_run,
+            steer_run,
             stop_run,
             review_hypothesis,
             hydrate_workspace,

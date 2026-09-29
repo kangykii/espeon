@@ -1,0 +1,22 @@
+name: Feature request
+description: Suggest an improvement to Espeon
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem should this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would you like Espeon to do?
+    validations:
+      required: true
+  - type: textarea
+    id: impact
+    attributes:
+      label: Trading or security impact
+      description: Explain whether this affects broker access, order routing, sizing, risk, or account data.

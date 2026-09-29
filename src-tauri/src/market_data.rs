@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -157,7 +157,7 @@ pub fn requirements(spec: &LiveContextSpec) -> Result<Vec<SeriesRequirement>> {
     for source in spec.series_sources.values() {
         if !matches!(
             source.as_str(),
-            "twelve-data-rest" | "ctrader-fix-price-only"
+            "twelve-data-rest" | "ctrader-fix-price-only" | "ctrader-open-api"
         ) {
             bail!("live context selected an unsupported candle source");
         }
@@ -806,15 +806,56 @@ pub struct CTraderOpenApiConfig {
     port: u16,
     client_id: String,
     client_secret: String,
-    access_token: String,
-    account_id: i64,
-    symbol_map: HashMap<String, i64>,
+    token_state: std::sync::Arc<Mutex<OpenApiTokenState>>,
+    project_root: PathBuf,
+    account_id: Option<i64>,
+    mcp_account_login: Option<i64>,
+    environment: String,
+    symbol_map: std::sync::Arc<Mutex<HashMap<String, i64>>>,
     history_depth: usize,
     quote_max_age_seconds: u64,
     timeout: Duration,
 }
 
+struct OpenApiTokenState {
+    access_token: String,
+    refresh_token: String,
+    expires_at: Option<i64>,
+    refresh_retry_after: Option<i64>,
+}
+
 impl CTraderOpenApiConfig {
+    /// Loads Open API settings only when the integration has been configured.
+    /// Missing credentials are a normal optional-source state, not a startup error.
+    pub fn load_optional(project_root: &Path) -> Result<Option<Self>> {
+        dotenvy::from_path_override(project_root.join(".env")).ok();
+        let configured = [
+            "CTRADER_OPEN_API_CLIENT_ID",
+            "CTRADER_OPEN_API_CLIENT_SECRET",
+        ]
+        .iter()
+        .all(|key| env::var(key).is_ok_and(|value| !value.trim().is_empty()));
+        let has_token = [
+            "CTRADER_OPEN_API_ACCESS_TOKEN",
+            "CTRADER_OPEN_API_REFRESH_TOKEN",
+        ]
+        .iter()
+        .any(|key| {
+            env::var(key)
+                .is_ok_and(|value| !value.trim().is_empty() && !value.starts_with("REQUIRED_"))
+        });
+        if !configured || !has_token {
+            return Ok(None);
+        }
+        match Self::load(project_root) {
+            Ok(config) => Ok(Some(config)),
+            Err(error) => {
+                eprintln!("cTrader Open API market-data source is disabled: {error:#}");
+                Ok(None)
+            }
+        }
+    }
+
     pub fn load(project_root: &Path) -> Result<Self> {
         dotenvy::from_path_override(project_root.join(".env")).ok();
         let required = |name: &str| -> Result<String> {
@@ -824,8 +865,11 @@ impl CTraderOpenApiConfig {
             }
             Ok(value)
         };
-        let environment =
-            env::var("CTRADER_OPEN_API_ENVIRONMENT").unwrap_or_else(|_| "demo".into());
+        let environment = env::var("CTRADER_OPEN_API_ENVIRONMENT")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| env::var("CTRADER_MCP_ENVIRONMENT").ok())
+            .unwrap_or_else(|| "demo".into());
         let host = env::var("CTRADER_OPEN_API_HOST").unwrap_or_else(|_| {
             if environment.eq_ignore_ascii_case("live") {
                 "live.ctraderapi.com".into()
@@ -835,49 +879,45 @@ impl CTraderOpenApiConfig {
         });
         let client_id = required("CTRADER_OPEN_API_CLIENT_ID")?;
         let client_secret = required("CTRADER_OPEN_API_CLIENT_SECRET")?;
-        let access_token = env::var("CTRADER_OPEN_API_ACCESS_TOKEN").unwrap_or_default();
-        let access_token =
-            if access_token.trim().is_empty() || access_token.starts_with("REQUIRED_") {
-                let refresh_token = required("CTRADER_OPEN_API_REFRESH_TOKEN")?;
-                let response = reqwest::blocking::Client::new()
-                    .get("https://openapi.ctrader.com/apps/token")
-                    .query(&[
-                        ("grant_type", "refresh_token"),
-                        ("refresh_token", refresh_token.as_str()),
-                        ("client_id", client_id.as_str()),
-                        ("client_secret", client_secret.as_str()),
-                    ])
-                    .send()
-                    .context("refresh cTrader Open API access token")?;
-                let status = response.status();
-                let body: serde_json::Value = response
-                    .json()
-                    .context("decode cTrader token refresh response")?;
-                if !status.is_success() {
-                    bail!("cTrader token refresh failed with HTTP {status}: {body}");
+        let mut access_token = env::var("CTRADER_OPEN_API_ACCESS_TOKEN")
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        let mut refresh_token = env::var("CTRADER_OPEN_API_REFRESH_TOKEN")
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        let mut token_expiry = env::var("CTRADER_OPEN_API_ACCESS_TOKEN_EXPIRES_AT")
+            .ok()
+            .and_then(|value| value.trim().parse::<i64>().ok());
+        let refresh_is_configured =
+            !refresh_token.is_empty() && !refresh_token.starts_with("REQUIRED_");
+        let refresh_is_due = access_token.is_empty()
+            || access_token.starts_with("REQUIRED_")
+            || token_expiry.map_or(true, |expiry| expiry <= Utc::now().timestamp() + 120);
+        let mut refresh_retry_after = None;
+        if refresh_is_configured && refresh_is_due {
+            match refresh_open_api_tokens(project_root, &client_id, &client_secret, &refresh_token)
+            {
+                Ok(tokens) => {
+                    access_token = tokens.access_token;
+                    refresh_token = tokens.refresh_token;
+                    token_expiry = tokens.expires_at;
                 }
-                body.get("accessToken")
-                    .or_else(|| body.get("access_token"))
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-                    .context("cTrader token refresh omitted access token")?
-            } else {
-                access_token
-            };
-        let symbol_map = required("CTRADER_OPEN_API_SYMBOL_MAP")?
-            .split(',')
-            .map(|entry| {
-                let (name, id) = entry.split_once(':').with_context(|| {
-                    format!("invalid CTRADER_OPEN_API_SYMBOL_MAP entry {entry}")
-                })?;
-                Ok((
-                    name.trim()
-                        .to_ascii_uppercase()
-                        .replace(['/', '-', '_'], ""),
-                    id.trim().parse::<i64>()?,
-                ))
-            })
-            .collect::<Result<HashMap<_, _>>>()?;
+                Err(error)
+                    if !access_token.trim().is_empty()
+                        && !access_token.starts_with("REQUIRED_")
+                        && token_expiry.map_or(true, |expiry| expiry > Utc::now().timestamp()) =>
+                {
+                    eprintln!("cTrader Open API token refresh failed; retaining the unexpired access token: {error:#}");
+                    refresh_retry_after = Some(Utc::now().timestamp() + 60);
+                }
+                Err(error) => return Err(error).context("refresh cTrader Open API access token"),
+            }
+        }
+        if access_token.trim().is_empty() || access_token.starts_with("REQUIRED_") {
+            bail!("CTRADER_OPEN_API_ACCESS_TOKEN or CTRADER_OPEN_API_REFRESH_TOKEN is required");
+        }
         let history_depth = env::var("CTRADER_MARKET_HISTORY_DEPTH")
             .ok()
             .map(|v| v.parse())
@@ -893,11 +933,27 @@ impl CTraderOpenApiConfig {
                 .unwrap_or(5035),
             client_id,
             client_secret,
-            access_token,
-            account_id: required("CTRADER_OPEN_API_ACCOUNT_ID")?
-                .parse()
-                .context("CTRADER_OPEN_API_ACCOUNT_ID must be an integer")?,
-            symbol_map,
+            token_state: std::sync::Arc::new(Mutex::new(OpenApiTokenState {
+                access_token,
+                refresh_token,
+                expires_at: token_expiry,
+                refresh_retry_after,
+            })),
+            project_root: project_root.to_path_buf(),
+            account_id: env::var("CTRADER_OPEN_API_ACCOUNT_ID")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| {
+                    value
+                        .parse()
+                        .context("cTrader Open API account ID must be an integer")
+                })
+                .transpose()?,
+            mcp_account_login: env::var("CTRADER_MCP_ACCOUNT_ID")
+                .ok()
+                .and_then(|value| value.trim().parse().ok()),
+            environment,
+            symbol_map: std::sync::Arc::new(Mutex::new(HashMap::new())),
             history_depth,
             quote_max_age_seconds: env::var("CTRADER_MARKET_QUOTE_MAX_AGE_SECONDS")
                 .ok()
@@ -912,6 +968,245 @@ impl CTraderOpenApiConfig {
                     .unwrap_or(15),
             ),
         })
+    }
+
+    fn access_token(&self) -> Result<String> {
+        let mut state = self.token_state.lock();
+        let now = Utc::now().timestamp();
+        let refresh_due = state.expires_at.map_or(true, |expiry| expiry <= now + 120);
+        if refresh_due {
+            let current_token_still_unexpired =
+                state.expires_at.map_or(true, |expiry| expiry > now);
+            if current_token_still_unexpired
+                && state
+                    .refresh_retry_after
+                    .is_some_and(|retry_after| retry_after > now)
+            {
+                return Ok(state.access_token.clone());
+            }
+            if state.refresh_token.trim().is_empty() || state.refresh_token.starts_with("REQUIRED_")
+            {
+                bail!(
+                    "cTrader Open API access token expires soon and no refresh token is configured"
+                );
+            }
+            match refresh_open_api_tokens(
+                &self.project_root,
+                &self.client_id,
+                &self.client_secret,
+                &state.refresh_token,
+            ) {
+                Ok(next) => *state = next,
+                Err(error) if current_token_still_unexpired => {
+                    eprintln!("cTrader Open API token refresh failed; retaining the unexpired access token: {error:#}");
+                    state.refresh_retry_after = Some(now + 60);
+                }
+                Err(error) => {
+                    return Err(error).context("refresh expired cTrader Open API access token");
+                }
+            }
+        }
+        Ok(state.access_token.clone())
+    }
+}
+
+fn refresh_open_api_tokens(
+    project_root: &Path,
+    client_id: &str,
+    client_secret: &str,
+    refresh_token: &str,
+) -> Result<OpenApiTokenState> {
+    let response = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .context("create cTrader token refresh client")?
+        .get("https://openapi.ctrader.com/apps/token")
+        .query(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+            ("client_id", client_id),
+            ("client_secret", client_secret),
+        ])
+        .send()
+        .context("send cTrader token refresh request")?;
+    let status = response.status();
+    let body: Value = response
+        .json()
+        .context("decode cTrader token refresh response")?;
+    if !status.is_success() {
+        let error_code = body
+            .get("errorCode")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown error");
+        bail!("cTrader token refresh failed with HTTP {status} ({error_code})");
+    }
+    let next_access = body
+        .get("accessToken")
+        .or_else(|| body.get("access_token"))
+        .and_then(Value::as_str)
+        .filter(|token| !token.trim().is_empty())
+        .context("cTrader token refresh omitted access token")?;
+    let next_refresh = body
+        .get("refreshToken")
+        .or_else(|| body.get("refresh_token"))
+        .and_then(Value::as_str)
+        .filter(|token| !token.trim().is_empty())
+        .context("cTrader token refresh omitted rotated refresh token")?;
+    let lifetime_seconds = body
+        .get("expiresIn")
+        .or_else(|| body.get("expires_in"))
+        .and_then(Value::as_i64)
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or(2_628_000);
+    let expires_at = Utc::now().timestamp().saturating_add(lifetime_seconds);
+    crate::config::persist_open_api_tokens(project_root, next_access, next_refresh, expires_at)
+        .context("persist rotated cTrader Open API token pair and expiry")?;
+    Ok(OpenApiTokenState {
+        access_token: next_access.to_owned(),
+        refresh_token: next_refresh.to_owned(),
+        expires_at: Some(expires_at),
+        refresh_retry_after: None,
+    })
+}
+
+impl CTraderOpenApiConfig {
+    pub fn volume_rules(
+        &self,
+        instruments: &[String],
+    ) -> Result<HashMap<String, OpenApiVolumeRules>> {
+        let mut connection = OpenApiConnection::connect(self)?;
+        let mut rules = HashMap::new();
+        for instrument in instruments {
+            let normalized = instrument.to_ascii_uppercase().replace(['/', '-', '_'], "");
+            let symbol_id = connection.symbol_id(&normalized)?;
+            let response = connection.request(
+                2112,
+                &SymbolByIdReq {
+                    account_id: connection.account_id,
+                    symbol_id: vec![symbol_id],
+                },
+                2113,
+            )?;
+            let payload = response
+                .payload
+                .context("cTrader symbol-details response omitted payload")?;
+            let details = SymbolByIdRes::decode(payload.as_slice())?;
+            let mut matching = details
+                .symbol
+                .into_iter()
+                .filter(|item| item.symbol_id == symbol_id);
+            let symbol = matching
+                .next()
+                .context("cTrader Open API returned no details for the selected symbol")?;
+            if matching.next().is_some() {
+                bail!("cTrader Open API returned duplicate details for symbol {normalized}");
+            }
+            if symbol.symbol_name.as_deref().is_some_and(|name| {
+                name.to_ascii_uppercase().replace(['/', '-', '_'], "") != normalized
+            }) {
+                bail!("cTrader Open API symbol ID resolved to a different symbol name");
+            }
+            let min = symbol
+                .min_volume
+                .context("cTrader symbol metadata omitted minVolume")?;
+            let step = symbol
+                .step_volume
+                .context("cTrader symbol metadata omitted stepVolume")?;
+            let lot = symbol
+                .lot_size
+                .context("cTrader symbol metadata omitted lotSize")?;
+            if min <= 0 || step <= 0 || lot <= 0 {
+                bail!("cTrader symbol metadata contains non-positive volume values");
+            }
+            let maximum = symbol.max_volume.map(|value| value as f64 / lot as f64);
+            if maximum.is_some_and(|value| !value.is_finite() || value < min as f64 / lot as f64) {
+                bail!("cTrader symbol metadata has an invalid maxVolume");
+            }
+            rules.insert(
+                normalized,
+                OpenApiVolumeRules {
+                    minimum_lots: min as f64 / lot as f64,
+                    step_lots: step as f64 / lot as f64,
+                    maximum_lots: maximum,
+                },
+            );
+        }
+        Ok(rules)
+    }
+
+    pub fn history(
+        &self,
+        instrument: &str,
+        period: &MarketDataPeriod,
+        count: usize,
+    ) -> Result<Vec<Candle>> {
+        let normalized = instrument.to_ascii_uppercase().replace(['/', '-', '_'], "");
+        let now = Utc::now();
+        let requested = count.max(self.history_depth).min(1_000);
+        let to = (now.timestamp().div_euclid(period.seconds()) * period.seconds()) * 1_000;
+        let from = to - (requested as i64 + 2) * period.seconds() * 1_000;
+        let mut connection = OpenApiConnection::connect(self)?;
+        let symbol_id = connection.symbol_id(&normalized)?;
+        let response = connection.request(
+            2137,
+            &GetTrendbarsReq {
+                account_id: connection.account_id,
+                from_timestamp: Some(from),
+                to_timestamp: Some(to - 1),
+                period: proto_period(period) as i32,
+                symbol_id,
+                count: Some(requested as u32),
+            },
+            2138,
+        )?;
+        let payload = response
+            .payload
+            .context("cTrader trendbar response omitted payload")?;
+        let decoded = GetTrendbarsRes::decode(payload.as_slice())?;
+        let mut candles = decoded
+            .trendbar
+            .into_iter()
+            .map(|bar| {
+                let low = bar.low.unwrap_or_default() as f64 / 100_000.0;
+                let minute = bar.utc_timestamp_minutes.unwrap_or_default() as i64;
+                Candle {
+                    id: format!("ctrader-openapi-{symbol_id}-{}-{minute}", period.seconds()),
+                    symbol: normalized.clone(),
+                    period: period.clone(),
+                    open_time: Utc.timestamp_opt(minute * 60, 0).single().unwrap_or(now),
+                    open: low + bar.delta_open.unwrap_or(0) as f64 / 100_000.0,
+                    high: low + bar.delta_high.unwrap_or(0) as f64 / 100_000.0,
+                    low,
+                    close: low + bar.delta_close.unwrap_or(0) as f64 / 100_000.0,
+                    tick_volume: bar.volume.max(0) as u64,
+                    provider_volume: None,
+                    volume_kind: Some("broker_tick_volume".into()),
+                    received_at: Some(now),
+                    source_observation_ids: Vec::new(),
+                    closed: true,
+                    provenance: "ctrader-open-api-historical-trendbar".into(),
+                }
+            })
+            .collect::<Vec<_>>();
+        candles.sort_by_key(|candle| candle.open_time);
+        candles
+            .retain(|candle| candle.open_time + chrono::Duration::seconds(period.seconds()) <= now);
+        if candles.len() < count {
+            bail!(
+                "cTrader Open API returned {} completed {:?} bars; {} required",
+                candles.len(),
+                period,
+                count
+            );
+        }
+        Ok(candles
+            .into_iter()
+            .rev()
+            .take(count)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect())
     }
 }
 
@@ -939,6 +1234,89 @@ struct AccountAuthReq {
     account_id: i64,
     #[prost(string, tag = "3")]
     access_token: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct GetAccountsByAccessTokenReq {
+    #[prost(string, tag = "2")]
+    access_token: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct GetAccountsByAccessTokenRes {
+    #[prost(message, repeated, tag = "4")]
+    account: Vec<CTraderAccount>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct CTraderAccount {
+    #[prost(int64, tag = "1")]
+    account_id: i64,
+    #[prost(bool, optional, tag = "2")]
+    is_live: Option<bool>,
+    #[prost(int64, optional, tag = "3")]
+    trader_login: Option<i64>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct SymbolsListReq {
+    #[prost(int64, tag = "2")]
+    account_id: i64,
+    #[prost(bool, optional, tag = "3")]
+    include_archived_symbols: Option<bool>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct SymbolsListRes {
+    #[prost(message, repeated, tag = "3")]
+    symbol: Vec<LightSymbol>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct LightSymbol {
+    #[prost(int64, tag = "1")]
+    symbol_id: i64,
+    #[prost(string, optional, tag = "2")]
+    symbol_name: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct SymbolByIdReq {
+    #[prost(int64, tag = "2")]
+    account_id: i64,
+    #[prost(int64, repeated, tag = "3")]
+    symbol_id: Vec<i64>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct SymbolByIdRes {
+    #[prost(int64, tag = "2")]
+    account_id: i64,
+    #[prost(message, repeated, tag = "3")]
+    symbol: Vec<ProtoSymbol>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct ProtoSymbol {
+    #[prost(int64, tag = "1")]
+    symbol_id: i64,
+    #[prost(string, optional, tag = "2")]
+    symbol_name: Option<String>,
+    #[prost(int64, optional, tag = "9")]
+    max_volume: Option<i64>,
+    #[prost(int64, optional, tag = "10")]
+    min_volume: Option<i64>,
+    #[prost(int64, optional, tag = "11")]
+    step_volume: Option<i64>,
+    #[prost(int64, optional, tag = "30")]
+    lot_size: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct OpenApiVolumeRules {
+    pub minimum_lots: f64,
+    pub step_lots: f64,
+    pub maximum_lots: Option<f64>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -1013,10 +1391,13 @@ fn proto_period(period: &MarketDataPeriod) -> TrendbarPeriod {
 
 struct OpenApiConnection {
     stream: TlsStream<TcpStream>,
+    account_id: i64,
+    symbol_map: HashMap<String, i64>,
 }
 
 impl OpenApiConnection {
     fn connect(config: &CTraderOpenApiConfig) -> Result<Self> {
+        let access_token = config.access_token()?;
         let address = (config.host.as_str(), config.port)
             .to_socket_addrs()?
             .next()
@@ -1026,7 +1407,11 @@ impl OpenApiConnection {
         tcp.set_write_timeout(Some(config.timeout))?;
         tcp.set_nodelay(true)?;
         let stream = TlsConnector::new()?.connect(&config.host, tcp)?;
-        let mut connection = Self { stream };
+        let mut connection = Self {
+            stream,
+            account_id: 0,
+            symbol_map: HashMap::new(),
+        };
         connection.request(
             2100,
             &ApplicationAuthReq {
@@ -1035,15 +1420,106 @@ impl OpenApiConnection {
             },
             2101,
         )?;
+
+        let account_list = connection.request(
+            2149,
+            &GetAccountsByAccessTokenReq {
+                access_token: access_token.clone(),
+            },
+            2150,
+        )?;
+        let account_list_payload = account_list
+            .payload
+            .context("cTrader account-list response omitted payload")?;
+        let authorized: GetAccountsByAccessTokenRes =
+            Message::decode(account_list_payload.as_slice())?;
+        let requested_live = config.environment.eq_ignore_ascii_case("live");
+        let account_id = if let Some(account_id) = config.account_id {
+            let record = authorized
+                .account
+                .iter()
+                .find(|account| account.account_id == account_id)
+                .context("configured Open API account is not authorized by the saved token")?;
+            if record
+                .is_live
+                .is_some_and(|is_live| is_live != requested_live)
+            {
+                bail!("configured Open API account environment does not match cTrader environment");
+            }
+            account_id
+        } else {
+            let matching = authorized
+                .account
+                .iter()
+                .filter(|account| account.is_live == Some(requested_live))
+                .collect::<Vec<_>>();
+            match matching.as_slice() {
+                [account] => account.account_id,
+                [] => bail!(
+                    "Open API token has no authorized {0} account",
+                    config.environment
+                ),
+                _ => {
+                    let matching_login = config.mcp_account_login.and_then(|login| {
+                        let by_login = matching
+                            .iter()
+                            .filter(|account| account.trader_login == Some(login))
+                            .collect::<Vec<_>>();
+                        if by_login.len() == 1 {
+                            Some(by_login[0].account_id)
+                        } else {
+                            None
+                        }
+                    });
+                    matching_login.with_context(|| {
+                        format!(
+                            "Open API token has multiple authorized {} accounts and none uniquely matches the cTrader login; set CTRADER_OPEN_API_ACCOUNT_ID",
+                            config.environment
+                        )
+                    })?
+                }
+            }
+        };
+        connection.account_id = account_id;
         connection.request(
             2102,
             &AccountAuthReq {
-                account_id: config.account_id,
-                access_token: config.access_token.clone(),
+                account_id,
+                access_token,
             },
             2103,
         )?;
+        let cached_symbols = config.symbol_map.lock().clone();
+        if cached_symbols.is_empty() {
+            let symbols = connection.request(
+                2114,
+                &SymbolsListReq {
+                    account_id,
+                    include_archived_symbols: Some(false),
+                },
+                2115,
+            )?;
+            let symbols_payload = symbols
+                .payload
+                .context("cTrader symbol-list response omitted payload")?;
+            let symbols: SymbolsListRes = Message::decode(symbols_payload.as_slice())?;
+            for symbol in symbols.symbol {
+                if let Some(name) = symbol.symbol_name {
+                    let normalized = name.to_ascii_uppercase().replace(['/', '-', '_'], "");
+                    connection.symbol_map.insert(normalized, symbol.symbol_id);
+                }
+            }
+            *config.symbol_map.lock() = connection.symbol_map.clone();
+        } else {
+            connection.symbol_map = cached_symbols;
+        }
         Ok(connection)
+    }
+
+    fn symbol_id(&self, instrument: &str) -> Result<i64> {
+        self.symbol_map.get(instrument).copied().with_context(|| {
+            format!("cTrader Open API account does not expose symbol {instrument}")
+        })
     }
 
     fn send<M: Message>(
@@ -1161,18 +1637,15 @@ impl HybridCTraderMarketDataProvider {
             }
             *last = Some(Instant::now());
         }
-        let symbol_id =
-            *self.open_api.symbol_map.get(&normalized).with_context(|| {
-                format!("CTRADER_OPEN_API_SYMBOL_MAP has no {normalized} entry")
-            })?;
         let requested = count.max(self.open_api.history_depth).min(1_000);
         let to = (now.timestamp().div_euclid(period.seconds()) * period.seconds()) * 1_000;
         let from = to - (requested as i64 + 2) * period.seconds() * 1_000;
         let mut connection = OpenApiConnection::connect(&self.open_api)?;
+        let symbol_id = connection.symbol_id(&normalized)?;
         let response = connection.request(
             2137,
             &GetTrendbarsReq {
-                account_id: self.open_api.account_id,
+                account_id: connection.account_id,
                 from_timestamp: Some(from),
                 to_timestamp: Some(to - 1),
                 period: proto_period(period) as i32,

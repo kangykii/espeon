@@ -1097,7 +1097,11 @@ impl CanonicalStore {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    pub fn recent_continuation_events(&self, run_id: &str, limit: usize) -> Result<Vec<StoredEvent>> {
+    pub fn recent_continuation_events(
+        &self,
+        run_id: &str,
+        limit: usize,
+    ) -> Result<Vec<StoredEvent>> {
         let connection = self.connection.lock();
         let mut statement = connection.prepare(
             "SELECT sequence,id,run_id,loop_id,kind,aggregate_type,aggregate_id,
@@ -1153,6 +1157,13 @@ impl CanonicalStore {
                         .get("error")
                         .and_then(|value| value.as_str())
                         .map(str::to_owned),
+                    "run_steering_queued" => stored
+                        .event
+                        .payload
+                        .get("instruction")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_owned),
+                    "run_steering_applied" => Some("Delivered to the Jev decision prompt".into()),
                     "market_service_state_changed" => stored
                         .event
                         .payload

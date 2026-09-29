@@ -52,9 +52,11 @@ and completed, source-labelled candles. Encode each `expression` as a JSON-seria
 containing the expression object. The string is parsed and validated by Rust before use.
 Choose needed periods/lookbacks. Never use prose, code, future/partial candles, or broker/order authority in formulas. Twelve Data REST
 provides OHLC and provider_volume when available. FIX bars are price-only; do not request
-tick_volume from FIX. Empty liveContextSeriesSources prefers Twelve Data then qualified FIX
-price bars; otherwise choose one allowed source per period. Volume formulas must select
-twelve-data-rest and provider_volume. Active formula operands must be present and typed.
+tick_volume from FIX. cTrader Open API historical trendbars provide broker tick_volume;
+choose ctrader-open-api for tick-volume formulas. For price-only formulas, prefer cTrader Open
+API, then Twelve Data, then qualified FIX bars. Volume formulas must choose a compatible
+source per period: twelve-data-rest for provider_volume, ctrader-open-api for tick_volume.
+Active formula operands must be present and typed.
 Each formula node is a tagged, operation-specific object: include only that operation's
 required operands and never emit inactive null properties. Example expression string:
 `"{\"op\":\"greater_than\",\"left\":{\"op\":\"current_mid\"},\"right\":{\"op\":\"series\",\"period\":\"M15\",\"column\":\"close\",\"lag\":0}}"`.
@@ -460,7 +462,10 @@ impl OpenRouterWorldModel {
                 .as_str()
                 .context("source selection omitted source")?;
             if !matches!(period, "M1" | "M5" | "M15" | "M30" | "H1" | "H4" | "D1")
-                || !matches!(source, "twelve-data-rest" | "ctrader-fix-price-only")
+                || !matches!(
+                    source,
+                    "twelve-data-rest" | "ctrader-fix-price-only" | "ctrader-open-api"
+                )
             {
                 bail!("world model selected unsupported market source");
             }
@@ -484,12 +489,92 @@ impl OpenRouterWorldModel {
         Ok((fields, sources))
     }
 
+    fn volume_operand_for_period(fields: &[LiveContextFieldSpec], period: &str) -> bool {
+        fn visit(value: &Value, period: &str) -> bool {
+            match value {
+                Value::Object(object) => {
+                    let volume_column =
+                        object
+                            .get("column")
+                            .and_then(Value::as_str)
+                            .is_some_and(|column| {
+                                matches!(
+                                    column.to_ascii_lowercase().as_str(),
+                                    "volume" | "provider_volume" | "tick_volume"
+                                )
+                            });
+                    let matching_period = object
+                        .get("period")
+                        .and_then(Value::as_str)
+                        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(period));
+                    (volume_column && matching_period)
+                        || object.values().any(|child| visit(child, period))
+                }
+                Value::Array(items) => items.iter().any(|item| visit(item, period)),
+                _ => false,
+            }
+        }
+
+        fields.iter().any(|field| {
+            serde_json::to_value(&field.expression)
+                .is_ok_and(|expression| visit(&expression, period))
+        })
+    }
+
+    fn tick_volume_operand_for_period(fields: &[LiveContextFieldSpec], period: &str) -> bool {
+        fn visit(value: &Value, period: &str) -> bool {
+            match value {
+                Value::Object(object) => {
+                    let matches = object
+                        .get("column")
+                        .and_then(Value::as_str)
+                        .is_some_and(|column| column.eq_ignore_ascii_case("tick_volume"))
+                        && object
+                            .get("period")
+                            .and_then(Value::as_str)
+                            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(period));
+                    matches || object.values().any(|child| visit(child, period))
+                }
+                Value::Array(items) => items.iter().any(|item| visit(item, period)),
+                _ => false,
+            }
+        }
+        fields.iter().any(|field| {
+            serde_json::to_value(&field.expression)
+                .is_ok_and(|expression| visit(&expression, period))
+        })
+    }
+
+    fn unpin_price_only_twelve_data_sources(
+        fields: &[LiveContextFieldSpec],
+        sources: &mut HashMap<String, String>,
+    ) {
+        // Twelve Data is the preferred source, but pinning price-only formulas
+        // to it makes a transient REST gap suppress Jev even when Espeon has
+        // complete broker FIX candles. Leave volume formulas pinned: FIX bars
+        // have no market-volume measure and must never be substituted there.
+        for period in ["M1", "M5", "M15", "M30", "H1", "H4", "D1"] {
+            if Self::tick_volume_operand_for_period(fields, period) {
+                sources.insert(period.into(), "ctrader-open-api".into());
+            }
+        }
+        sources.retain(|period, source| {
+            if Self::tick_volume_operand_for_period(fields, period) && source == "twelve-data-rest"
+            {
+                *source = "ctrader-open-api".into();
+            }
+            source != "twelve-data-rest" || Self::volume_operand_for_period(fields, period)
+        });
+    }
+
     fn parse_contract_proposal(
         &self,
         plan: &Value,
         user_objective: &str,
     ) -> Result<crate::contracts::HypothesisContractDraft> {
-        let (live_context_fields, series_sources) = Self::validate_formulation_live_context(plan)?;
+        let (live_context_fields, mut series_sources) =
+            Self::validate_formulation_live_context(plan)?;
+        Self::unpin_price_only_twelve_data_sources(&live_context_fields, &mut series_sources);
         let strings = |key: &str| -> Result<Vec<String>> {
             plan[key]
                 .as_array()
@@ -592,8 +677,8 @@ impl OpenRouterWorldModel {
                 "jev2Objective":{"type":"string"},
                 "supportEvidenceIds":{"type":"array","items":{"type":"string"}},"contradictoryEvidenceIds":{"type":"array","items":{"type":"string"}},
                 "keyAssumptions":{"type":"array","minItems":1,"items":{"type":"string"}},"alternativeExplanation":{"type":"string"},"invalidationConditions":{"type":"array","minItems":1,"items":{"type":"string"}},
-                "liveContextSeriesSources":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["period","source"],"properties":{"period":{"type":"string","enum":["M1","M5","M15","M30","H1","H4","D1"]},"source":{"type":"string","enum":["twelve-data-rest","ctrader-fix-price-only"]}}}},
-                "contextRequirements":{"type":"array","minItems":1,"items":{"type":"object","additionalProperties":false,"required":["id","source","valueType","period","lookback","maximumAgeSeconds","required"],"properties":{"id":{"type":"string"},"source":{"type":"string","enum":["c_trader_fix","twelve_data_rest","canonical_evidence","c_trader_mcp_read_only"]},"valueType":{"type":"string","enum":["quote","candle","indicator","account","position","evidence"]},"period":{"anyOf":[{"type":"string","enum":["M1","M5","M15","M30","H1","H4","D1"]},{"type":"null"}]},"lookback":{"anyOf":[{"type":"integer","minimum":1,"maximum":1000},{"type":"null"}]},"maximumAgeSeconds":{"type":"integer","minimum":1},"required":{"type":"boolean"}}}},
+                "liveContextSeriesSources":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["period","source"],"properties":{"period":{"type":"string","enum":["M1","M5","M15","M30","H1","H4","D1"]},"source":{"type":"string","enum":["twelve-data-rest","ctrader-fix-price-only","ctrader-open-api"]}}}},
+                "contextRequirements":{"type":"array","minItems":1,"items":{"type":"object","additionalProperties":false,"required":["id","source","valueType","period","lookback","maximumAgeSeconds","required"],"properties":{"id":{"type":"string"},"source":{"type":"string","enum":["c_trader_fix","c_trader_open_api","twelve_data_rest","canonical_evidence","c_trader_mcp_read_only"]},"valueType":{"type":"string","enum":["quote","candle","indicator","account","position","evidence"]},"period":{"anyOf":[{"type":"string","enum":["M1","M5","M15","M30","H1","H4","D1"]},{"type":"null"}]},"lookback":{"anyOf":[{"type":"integer","minimum":1,"maximum":1000},{"type":"null"}]},"maximumAgeSeconds":{"type":"integer","minimum":1},"required":{"type":"boolean"}}}},
                 "brokerContextRequests":{"type":"array","items":{"type":"string","enum":["account","positions","symbol_details"]}},
                 // Empty is valid: the typed parser inserts the required
                 // lifecycle invocation from the authoritative prompt.
@@ -1964,11 +2049,13 @@ mod tests {
             }}]
         });
         let mut invalid = valid.clone();
-        invalid["liveContextFields"][0]["expression"] = json!({
+        let invalid_expression = json!({
             "op":"series","value":null,"period":null,"column":"close","lag":0,
             "window":null,"args":[],"left":null,"right":null,"numerator":null,
             "denominator":null,"low":null,"high":null
-        });
+        })
+        .to_string();
+        invalid["liveContextFields"][0]["expression"] = json!(invalid_expression);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {

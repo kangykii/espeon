@@ -438,7 +438,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn model_capability_catalog_discovers_skills_and_scoped_tools() {
         let registry = SkillRegistry::discover_builtin();
         let catalog = registry.catalog_json(true, false);

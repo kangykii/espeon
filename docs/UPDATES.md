@@ -1,9 +1,9 @@
-# Private Espeon releases
+# Signed updates
 
-Espeon checks the private `kangykii/espeon` GitHub repository when it starts and every six hours. A new signed release installs automatically when no experiment is active. While an experiment is active, Espeon waits and checks again after it stops. The app also has a **Check now** button in Connectors and settings.
+Espeon checks the public `kangykii/espeon` GitHub repository at startup and every six hours. A newer signed installer is downloaded and installed only when no experiment is active. The **Check now** action is available in settings.
 
-Private releases require GitHub authentication on each computer. Sign in with GitHub CLI (`gh auth login`), or enter a fine-grained token with **Contents: read** access to `espeon` in the **Private updates** settings section. The token remains in the local ignored `.env` file and is never bundled into the app or shown again after saving. Tauri verifies each installer against the public signing key embedded in the app.
+Public release checks do not require GitHub authentication. An optional read-only GitHub token can raise the API rate limit; it remains in the local ignored `.env` file and is not bundled in the app. The updater verifies each installer against the public signing key embedded in Espeon.
 
-To publish a new release, update the version in `package.json` and `src-tauri/tauri.conf.json` and `src-tauri/Cargo.toml`, commit, then push a matching tag such as `v0.1.3`. The Windows workflow builds the signed NSIS installer, uploads the installer and signature, creates an authenticated `latest.json`, and publishes the release after all assets are ready. Keep the local updater signing key and GitHub Actions `TAURI_SIGNING_PRIVATE_KEY` secret safe. Losing it means existing installations cannot verify future updates.
+To publish a release, update the versions in `package.json`, `src-tauri/tauri.conf.json`, and `src-tauri/Cargo.toml`, commit the changes, and push a matching version tag such as `v0.1.4`. The Windows workflow builds a signed NSIS installer, creates the updater manifest after uploading the installer and signature, and then publishes the release. Keep the updater signing private key only in secure local storage and GitHub Actions secrets. Losing that key prevents existing installations from verifying future updates.
 
-The standalone `target/release/espeon.exe` is a build artifact. Install a release installer once to place Espeon in the installed app location that the updater can replace. A fresh installation creates its own local configuration; the full Qdrant retrieval bridge still requires local Python dependencies.
+The standalone `target/release/espeon.exe` is a build artifact. Install a release installer to place Espeon in the app location the updater can replace. A fresh installation creates local configuration; the Qdrant retrieval bridge requires a local Python environment and its dependencies.

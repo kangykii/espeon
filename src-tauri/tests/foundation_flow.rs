@@ -1,5 +1,7 @@
 #[path = "../src/adapters.rs"]
 mod adapters;
+#[path = "../src/config.rs"]
+mod config;
 #[path = "../src/context.rs"]
 mod context;
 #[path = "../src/contracts.rs"]
@@ -8,6 +10,8 @@ mod contracts;
 mod ctrader_fix;
 #[path = "../src/domain.rs"]
 mod domain;
+#[path = "../src/evidence.rs"]
+mod evidence;
 #[path = "../src/freshness.rs"]
 mod freshness;
 #[path = "../src/harness.rs"]
@@ -1078,7 +1082,8 @@ fn qdrant_context_pool_supports_harvey_retrieval_and_automatic_logs() {
             run_id: comparison.run_id.clone(),
             hypothesis_id: comparison.hypotheses[0].id.clone(),
             evidence_query:
-                "Compare supporting and contradictory history; propose a competing split".into(),
+                "Compare supporting and contradictory history and modify the hypothesis timeframe"
+                    .into(),
         })
         .unwrap();
     let comparison_replay = controller.replay(&comparison.run_id).unwrap();
@@ -1137,8 +1142,8 @@ fn qdrant_context_pool_supports_harvey_retrieval_and_automatic_logs() {
         domain::EvidenceRelationship::Contradictory
     )));
     let candidate_review = comparison_replay.hypothesis_reviews.last().unwrap();
-    assert_eq!(candidate_review.action, domain::HypothesisAction::Split);
-    assert!(candidate_review.candidate_hypothesis.is_some());
+    assert_eq!(candidate_review.action, domain::HypothesisAction::Modify);
+    assert!(candidate_review.candidate_hypothesis.is_none());
     let serialized_package = serde_json::to_string(package).unwrap().to_ascii_lowercase();
     assert!(!serialized_package.contains("gpt-6"));
     assert!(!serialized_package.contains("opus"));

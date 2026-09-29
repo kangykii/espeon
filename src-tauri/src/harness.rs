@@ -452,7 +452,10 @@ fn normalize_contract_evidence_citations(
     retrieval_trace: Option<&RetrievalTrace>,
     additional_evidence_ids: &[String],
 ) {
-    let mut available = additional_evidence_ids.iter().cloned().collect::<std::collections::HashSet<_>>();
+    let mut available = additional_evidence_ids
+        .iter()
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
     if let Some(trace) = retrieval_trace {
         for hit in &trace.hits {
             for id in [&hit.id, &hit.canonical_entity_id, &hit.canonical_event_id] {
@@ -887,6 +890,38 @@ impl HarnessController {
         source_run_id: &str,
     ) -> Result<RunSnapshot> {
         self.start_linked(human_thesis, Some(source_run_id))
+    }
+
+    pub fn steer_run(&mut self, run_id: &str, instruction: &str) -> Result<RunSnapshot> {
+        let instruction = instruction.trim();
+        if instruction.is_empty() {
+            bail!("steering instruction cannot be empty");
+        }
+        if instruction.chars().count() > 8_000 {
+            bail!("steering instruction is too long (maximum 8,000 characters)");
+        }
+        let active = self
+            .active_runs
+            .get(run_id)
+            .context("this run is no longer active; start a continuation instead")?;
+        let event_id = Uuid::new_v4().to_string();
+        let steer_event = event(
+            &event_id,
+            run_id,
+            None,
+            "run_steering_queued",
+            "run",
+            run_id,
+            Some(&active.last_event_id),
+            "Operator steering instruction queued for the next Jev decision",
+            json!({"instruction": instruction, "status": "queued"}),
+        );
+        self.store.append_event(&steer_event)?;
+        if let Some(active) = self.active_runs.get_mut(run_id) {
+            active.last_event_id = event_id;
+        }
+        self.schedule_immediate_cycle(run_id);
+        self.snapshot(run_id)
     }
 
     fn start_linked(
@@ -1463,9 +1498,22 @@ impl HarnessController {
                     .collect::<String>();
                 let mut facts = serde_json::Map::new();
                 for key in [
-                    "humanThesis", "thesis", "strategyMechanism", "instruments", "timeframe",
-                    "status", "action", "stage", "confidence", "rationale", "classification",
-                    "direction", "state", "symbol", "filledQuantity", "rejectionReasons",
+                    "humanThesis",
+                    "thesis",
+                    "strategyMechanism",
+                    "instruments",
+                    "timeframe",
+                    "status",
+                    "action",
+                    "stage",
+                    "confidence",
+                    "rationale",
+                    "classification",
+                    "direction",
+                    "state",
+                    "symbol",
+                    "filledQuantity",
+                    "rejectionReasons",
                 ] {
                     if let Some(value) = record.get(key).filter(|value| !value.is_null()) {
                         let value = match value {
@@ -1489,13 +1537,23 @@ impl HarnessController {
                     }
                 }
                 if event.kind == "context_record_ingested" {
-                    for key in ["title", "text", "sourceClass", "trustLevel", "provenanceUri"] {
+                    for key in [
+                        "title",
+                        "text",
+                        "sourceClass",
+                        "trustLevel",
+                        "provenanceUri",
+                    ] {
                         if let Some(value) = record.get(key).filter(|value| !value.is_null()) {
                             let value = value
                                 .as_str()
-                                .map(|text| serde_json::Value::String(
-                                    text.chars().take(if key == "text" { 1400 } else { 300 }).collect(),
-                                ))
+                                .map(|text| {
+                                    serde_json::Value::String(
+                                        text.chars()
+                                            .take(if key == "text" { 1400 } else { 300 })
+                                            .collect(),
+                                    )
+                                })
                                 .unwrap_or_else(|| value.clone());
                             facts.insert(key.into(), value);
                         }
@@ -1507,25 +1565,36 @@ impl HarnessController {
                 {
                     let mut contract_summary = serde_json::Map::new();
                     for key in [
-                        "thesis", "mechanism", "expectedBehavior", "timeframe",
-                        "supportingEvidenceIds", "contradictoryEvidenceIds", "invalidationConditions",
-                        "reviewTriggers", "stopLimits", "jev1Objective", "jev2Objective",
+                        "thesis",
+                        "mechanism",
+                        "expectedBehavior",
+                        "timeframe",
+                        "supportingEvidenceIds",
+                        "contradictoryEvidenceIds",
+                        "invalidationConditions",
+                        "reviewTriggers",
+                        "stopLimits",
+                        "jev1Objective",
+                        "jev2Objective",
                     ] {
                         if let Some(value) = proposal.get(key).filter(|value| !value.is_null()) {
                             let value = match value {
                                 serde_json::Value::String(text) => serde_json::Value::String(
                                     text.chars().take(1200).collect::<String>(),
                                 ),
-                                serde_json::Value::Array(items) => {
-                                    serde_json::Value::Array(items.iter().take(8).cloned().collect())
-                                }
+                                serde_json::Value::Array(items) => serde_json::Value::Array(
+                                    items.iter().take(8).cloned().collect(),
+                                ),
                                 _ => value.clone(),
                             };
                             contract_summary.insert(key.into(), value);
                         }
                     }
                     if !contract_summary.is_empty() {
-                        facts.insert("contractSummary".into(), serde_json::Value::Object(contract_summary));
+                        facts.insert(
+                            "contractSummary".into(),
+                            serde_json::Value::Object(contract_summary),
+                        );
                     }
                 }
                 json!({
@@ -1650,7 +1719,11 @@ impl HarnessController {
         let continuation_evidence_ids = continuation_context
             .as_ref()
             .and_then(|context| context["availableEvidenceIds"].as_array())
-            .map(|ids| ids.iter().filter_map(|id| id.as_str().map(str::to_owned)).collect::<Vec<_>>())
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(|id| id.as_str().map(str::to_owned))
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default();
         let (compiled, draft_event_id) = self.persist_validated_contract_draft(
             contract_draft,
@@ -1980,6 +2053,7 @@ impl HarnessController {
         cancellation: &AtomicBool,
     ) -> Result<RunSnapshot> {
         ensure_cycle_active(cancellation)?;
+        let pending_steering = self.pending_steering_instructions(run_id)?;
         if let Some(reason) = self.recovery_blocked_runs.get(run_id).cloned() {
             return match self.stop(run_id) {
                 Ok(snapshot) => {
@@ -2119,6 +2193,7 @@ impl HarnessController {
             })
             .map(|item| item.id.clone())
             .collect();
+        let mut steering_delivered = false;
         for loop_id in loop_ids {
             let (mut loop_state, hypothesis, thesis, context, position, user_objective, causation) = {
                 let active = self.active_runs.get(run_id).unwrap();
@@ -2238,10 +2313,15 @@ impl HarnessController {
             };
             let resolved = compiled_jev.state;
             let jev1_question = format!(
-                "The user's original trading instruction is authoritative and must be followed. If it explicitly restricts direction, instrument, or other entry conditions, do not contradict it. Original instruction: {}\n\nValidated loop entry objective: {}",
-                user_objective, compiled_jev.jev1_question
+                "The user's original trading instruction is authoritative and must be followed. If it explicitly restricts direction, instrument, or other entry conditions, do not contradict it. Original instruction: {}\n\nValidated loop entry objective: {}{}",
+                user_objective, compiled_jev.jev1_question, steering_prompt_section(&pending_steering)
             );
-            let jev2_question = compiled_jev.jev2_question;
+            let jev2_question = format!(
+                "{}{}",
+                compiled_jev.jev2_question,
+                steering_prompt_section(&pending_steering)
+            );
+            steering_delivered |= !pending_steering.is_empty();
             let cycle_reference_price = resolved
                 .live_context_snapshot
                 .as_ref()
@@ -2785,12 +2865,65 @@ impl HarnessController {
             }
             active.last_event_id = transition_event_id;
         }
+        if steering_delivered {
+            self.mark_steering_applied(run_id, &pending_steering)?;
+        }
         self.materialize_trade_outcomes(run_id)?;
         self.evaluate_autonomous_review_triggers(run_id)?;
         if let Some(context_pool) = &self.context_pool {
             context_pool.sync_pending_events(&self.store, run_id)?;
         }
         self.snapshot(run_id)
+    }
+
+    fn pending_steering_instructions(&self, run_id: &str) -> Result<Vec<(String, String)>> {
+        let events = self.store.stored_events(run_id)?;
+        let applied: std::collections::HashSet<String> = events
+            .iter()
+            .filter(|stored| stored.event.kind == "run_steering_applied")
+            .filter_map(|stored| stored.event.payload.get("instructionEventIds")?.as_array())
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .collect();
+        Ok(events
+            .into_iter()
+            .filter(|stored| {
+                stored.event.kind == "run_steering_queued" && !applied.contains(&stored.event.id)
+            })
+            .filter_map(|stored| {
+                let instruction = stored.event.payload.get("instruction")?.as_str()?.trim();
+                (!instruction.is_empty()).then(|| (stored.event.id, instruction.to_owned()))
+            })
+            .collect())
+    }
+
+    fn mark_steering_applied(
+        &mut self,
+        run_id: &str,
+        instructions: &[(String, String)],
+    ) -> Result<()> {
+        if instructions.is_empty() {
+            return Ok(());
+        }
+        let event_id = Uuid::new_v4().to_string();
+        let causation = instructions.last().map(|(id, _)| id.as_str());
+        let applied = event(
+            &event_id,
+            run_id,
+            None,
+            "run_steering_applied",
+            "run",
+            run_id,
+            causation,
+            "Operator steering instructions included in a Jev decision cycle",
+            json!({"instructionEventIds": instructions.iter().map(|(id, _)| id).collect::<Vec<_>>()}),
+        );
+        self.store.append_event(&applied)?;
+        if let Some(active) = self.active_runs.get_mut(run_id) {
+            active.last_event_id = event_id;
+        }
+        Ok(())
     }
 
     fn materialize_trade_outcomes(&mut self, run_id: &str) -> Result<()> {
@@ -7094,6 +7227,9 @@ fn validate_required_contract_context(
                     .context("required candle context has no period")?;
                 let expected_source = match requirement.source {
                     crate::contracts::ContextSource::CTraderFix => "ctrader-fix",
+                    crate::contracts::ContextSource::CTraderOpenApi => {
+                        "ctrader-open-api-historical-trendbar"
+                    }
                     crate::contracts::ContextSource::TwelveDataRest => "twelve-data-rest",
                     _ => bail!(
                         "required candle context {} uses an unsupported source",
@@ -7109,12 +7245,15 @@ fn validate_required_contract_context(
                     .candles
                     .iter()
                     .filter(|candle| {
-                        let is_fix_source = candle.provenance.contains("ctrader-fix")
-                            || candle.provenance.contains("ctrader-open-api");
+                        let is_fix_source = candle.provenance.contains("ctrader-fix");
                         let is_requested_source = if expected_source == "ctrader-fix" {
                             is_fix_source
+                        } else if expected_source == "ctrader-open-api-historical-trendbar" {
+                            candle.provenance == expected_source
                         } else if explicit_source.is_none() {
-                            candle.provenance.contains("twelve-data-rest") || is_fix_source
+                            candle.provenance.contains("twelve-data-rest")
+                                || is_fix_source
+                                || candle.provenance.contains("ctrader-open-api")
                         } else {
                             candle.provenance.contains(expected_source)
                         };
@@ -7170,6 +7309,7 @@ fn validate_required_contract_context(
                 }
                 let expected_source = match requirement.source {
                     crate::contracts::ContextSource::CTraderFix => "ctrader-fix",
+                    crate::contracts::ContextSource::CTraderOpenApi => "ctrader-open-api",
                     crate::contracts::ContextSource::TwelveDataRest => "twelve-data-rest",
                     _ => bail!(
                         "required indicator context {} uses an unsupported source",
@@ -7254,7 +7394,7 @@ fn broker_failure_receipt(
         broker_position_id: None,
         filled_quantity: 0.0,
         average_price: None,
-        rejection_reason: Some(error.to_string()),
+        rejection_reason: Some(format!("{error:#}")),
         raw_fix_report: None,
         created_by_event_id: event_id.into(),
         executed_at: Utc::now(),
@@ -8354,4 +8494,18 @@ fn event(
         occurred_at: Utc::now(),
         payload,
     }
+}
+
+fn steering_prompt_section(instructions: &[(String, String)]) -> String {
+    if instructions.is_empty() {
+        return String::new();
+    }
+    let lines = instructions
+        .iter()
+        .map(|(_, instruction)| format!("- {instruction}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "\n\nOperator steering for this decision cycle (honor it where compatible with the original instruction and the already validated contract; do not change contract or risk limits):\n{lines}"
+    )
 }

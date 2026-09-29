@@ -250,6 +250,9 @@ pub fn replay_run(store: &CanonicalStore, run_id: &str) -> Result<ReplayState> {
                 state.loops[existing_index] = loop_state;
             }
             "run_stopped" => state.status = "stopped".into(),
+            // Continuation metadata links this run to its source run; it
+            // does not alter the replayed state of the new run.
+            "run_continued_from" => {},
             "guardrail_evaluated"
             | "jev_inference_failed"
             | "live_context_resolution_failed"
@@ -316,7 +319,9 @@ fn loop_transition_record(
     // Keep the last complete loop projection and apply the fields this event
     // actually carried, so historical activity remains replayable.
     for (key, fallback) in previous_fields {
-        fields.entry(key.clone()).or_insert_with(|| fallback.clone());
+        fields
+            .entry(key.clone())
+            .or_insert_with(|| fallback.clone());
     }
     serde_json::from_value(value).with_context(|| format!("decode {description} record"))
 }

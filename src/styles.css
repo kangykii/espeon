@@ -150,7 +150,25 @@ kbd { color: var(--faint); font: 11px "IBM Plex Sans", sans-serif; }
 .market-warmup[data-state="ready"] { border-color: color-mix(in srgb,var(--accent) 42%,var(--line)); background: color-mix(in srgb,var(--accent) 7%,var(--panel)); }
 .market-warmup-heading { display: flex; align-items: flex-start; gap: 12px; }.market-warmup-heading > div { min-width: 0; }.market-warmup-badge { flex: none; margin-top: 2px; padding: 4px 7px; border-radius: 5px; color: var(--warning); background: color-mix(in srgb,var(--warning) 14%,transparent); font-size: 9px; font-weight: 700; letter-spacing: .05em; }
 .market-warmup[data-state="ready"] .market-warmup-badge { color: var(--accent); background: var(--accent-soft); }.market-warmup h2 { margin: 0; font-size: 13px; font-weight: 600; }.market-warmup p { margin: 5px 0 0; color: var(--muted); font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
-.market-warmup-path { display: grid; grid-template-columns: repeat(5,minmax(0,1fr)); gap: 8px; margin: 14px 0 0; padding: 0; list-style: none; }.market-warmup-path li { display: flex; align-items: center; gap: 6px; min-width: 0; color: var(--faint); font-size: 9.5px; }.market-warmup-path li > span { display: grid; place-items: center; flex: none; width: 18px; height: 18px; border: 1px solid var(--line-strong); border-radius: 50%; font-size: 9px; }.market-warmup-path li strong { overflow: hidden; font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }.market-warmup-path li[data-step="current"] { color: var(--text); }.market-warmup-path li[data-step="current"] > span { border-color: var(--warning); color: var(--warning); }.market-warmup[data-state="ready"] .market-warmup-path li[data-step="current"] > span { border-color: var(--accent); color: var(--accent); }.market-warmup-path li[data-step="done"] { color: var(--accent); }.market-warmup-path li[data-step="done"] > span { border-color: var(--accent); background: var(--accent-soft); }
+.market-warmup-path { display: grid; grid-template-columns: repeat(5,minmax(0,1fr)); gap: 8px; margin: 14px 0 0; padding: 0; list-style: none; }
+.market-warmup-path li { display: flex; align-items: flex-start; gap: 7px; min-width: 0; color: var(--faint); font-size: 9.5px; }
+.market-warmup-path li > span { display: grid; place-items: center; flex: none; width: 18px; height: 18px; border: 1px solid var(--line-strong); border-radius: 50%; font-size: 9px; }
+.market-warmup-path li > div { display: grid; min-width: 0; gap: 2px; }
+.market-warmup-path li strong { overflow: hidden; font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }
+.market-warmup-path li small { overflow: hidden; color: var(--muted); font-size: 9px; line-height: 1.3; text-overflow: ellipsis; white-space: nowrap; }
+.market-warmup-path li[data-step="current"] { color: var(--text); }
+.market-warmup-path li[data-step="current"] > span { border-color: var(--warning); color: var(--warning); }
+.market-warmup[data-state="ready"] .market-warmup-path li[data-step="current"] > span { border-color: var(--accent); color: var(--accent); }
+.market-warmup-path li[data-step="done"] { color: var(--accent); }
+.market-warmup-path li[data-step="done"] > span { border-color: var(--accent); background: var(--accent-soft); }
+.market-warmup-path li[data-step="blocked"] { color: var(--danger, #b42318); }
+.market-warmup-path li[data-step="blocked"] > span { border-color: currentColor; background: color-mix(in srgb,currentColor 10%,transparent); }
+.market-warmup-path li[data-step="skipped"] { opacity: .62; }
+.market-warmup[data-state="blocked"] { border-color: color-mix(in srgb,var(--danger, #b42318) 42%,var(--line)); background: color-mix(in srgb,var(--danger, #b42318) 5%,var(--panel)); }
+.market-warmup[data-state="complete"] { border-color: color-mix(in srgb,var(--accent) 42%,var(--line)); background: color-mix(in srgb,var(--accent) 7%,var(--panel)); }
+.market-warmup[data-state="blocked"] .market-warmup-badge { color: var(--danger, #b42318); background: color-mix(in srgb,var(--danger, #b42318) 12%,transparent); }
+.market-warmup[data-state="complete"] .market-warmup-badge { color: var(--accent); background: var(--accent-soft); }
+@media (max-width: 720px) { .market-warmup-path { grid-template-columns: repeat(2,minmax(0,1fr)); } }
 .structured-line { display: grid; grid-template-columns: auto 1fr auto 1fr; gap: 6px 9px; margin-top: 9px; font-size: 11.5px; }
 .structured-line span { color: var(--faint); }
 .canonical-ref { display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-top: 9px; color: var(--faint); font-size: 9.5px; }
@@ -187,6 +205,16 @@ kbd { color: var(--faint); font: 11px "IBM Plex Sans", sans-serif; }
 .decision-callout p { margin: 7px 0 0; color: var(--muted); font-size: 11px; line-height: 1.45; }
 .context-item { display: grid; gap: 3px; padding: 8px 0; border-top: 1px solid var(--line); }
 .context-item strong { font-size: 10.5px; }.context-item span,.context-item time { color: var(--muted); font-size: 10px; line-height: 1.4; }
+.context-item .context-value { color: var(--text); font-size: 11.5px; font-weight: 600; }
+.context-explanation { margin: 0; color: var(--muted); font-size: 10.5px; line-height: 1.45; }
+.context-item time { overflow-wrap: anywhere; }
+.context-technical { margin-top: 3px; color: var(--muted); font-size: 10px; }
+.context-technical summary { width: fit-content; color: var(--faint); cursor: pointer; }
+.context-technical summary:hover,.context-technical summary:focus-visible { color: var(--text); }
+.context-technical > p { margin: 8px 0 3px; color: var(--faint); font-size: 9.5px; font-weight: 600; }
+.context-technical pre { max-height: 150px; margin: 0; overflow: auto; padding: 7px; border: 1px solid var(--line); border-radius: 5px; background: var(--raised); font-size: 9px; overflow-wrap: anywhere; }
+.context-technical ul { display: grid; gap: 3px; margin: 0; padding-left: 16px; overflow-wrap: anywhere; font-size: 9px; }
+.context-technical li code { overflow-wrap: anywhere; }
 .empty-inspector { display: grid; justify-items: center; padding: 80px 28px; color: var(--muted); text-align: center; }
 .empty-inspector > span svg { width: 26px; height: 26px; }.empty-inspector h3 { margin: 13px 0 5px; font-size: 13px; }.empty-inspector p { margin: 0; font-size: 11px; line-height: 1.5; }
 .source-heading { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; color: var(--muted); font-size: 10px; text-transform: uppercase; }
@@ -295,6 +323,15 @@ kbd { color: var(--faint); font: 11px "IBM Plex Sans", sans-serif; }
 .settings-page-content .connector-field > span { font-size: 10.5px; }
 .settings-page-content .connector-field input { height: 36px; border: 0; border-bottom: 1px solid var(--line-strong); border-radius: 3px 3px 0 0; background: color-mix(in srgb,var(--raised) 68%,transparent); font-size: 11px; }
 .settings-page-content .connector-field input:focus { border-bottom-color: var(--accent); background: var(--raised); }
+.settings-page-content .connector-field-switch { grid-template-columns: minmax(165px,.34fr) minmax(0,1fr); }
+.connector-switch { position: relative; display: inline-flex; align-items: center; gap: 10px; }
+.settings-page-content .connector-switch input { position: absolute; z-index: 1; left: 0; width: 40px; height: 23px; margin: 0; padding: 0; border: 0; opacity: 0; cursor: pointer; }
+.connector-switch-track { position: relative; display: inline-block; width: 40px; height: 23px; border-radius: 999px; background: var(--line-strong); transition: background .16s ease; cursor: pointer; }
+.connector-switch-track::after { content: ""; position: absolute; top: 2px; left: 2px; width: 19px; height: 19px; border-radius: 50%; background: #fff; box-shadow: 0 1px 3px #0005; transition: transform .16s ease; }
+.connector-switch input:checked + .connector-switch-track { background: #34c759; }
+.connector-switch input:checked + .connector-switch-track::after { transform: translateX(17px); }
+.connector-switch input:focus-visible + .connector-switch-track { outline: 2px solid var(--accent); outline-offset: 2px; }
+.connector-switch i { min-width: 22px; color: var(--muted); font-size: 9px; font-style: normal; }
 .settings-page-content .manual-risk-approval { max-height: none; overflow: visible; gap: 11px; padding: 12px 0 4px; border: 0; background: transparent; }
 .settings-page-content .manual-risk-approval > strong { font-size: 12px; }
 .settings-page-content .manual-risk-approval > p { max-width: 900px; font-size: 10.5px; line-height: 1.55; }

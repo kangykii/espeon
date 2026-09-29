@@ -377,40 +377,56 @@ impl McpBrokerContext {
         // The legacy protocol is session based. Keep one negotiated session
         // for this connector instead of creating a new server session for
         // every broker read.
-        let mut legacy_session = self.legacy_session.lock();
-        let session = if let Some(session) = legacy_session.as_ref() {
-            session.clone()
-        } else {
-            let init = self.post(None, &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
-                "protocolVersion":LEGACY_MCP_VERSION,"capabilities":{},"clientInfo":{"name":"Espeon","version":"0.1.2"}}}), None)?;
-            let protocol_version = init
-                .0
-                .get("result")
-                .and_then(|result| result.get("protocolVersion"))
-                .and_then(Value::as_str)
-                .context("cTrader MCP initialize response omitted negotiated protocol version")?
-                .to_owned();
-            let session = LegacySession {
-                protocol_version,
-                session_id: init.1,
+        for attempt in 0..2 {
+            let mut legacy_session = self.legacy_session.lock();
+            let had_session = legacy_session.is_some();
+            let session = if let Some(session) = legacy_session.as_ref() {
+                session.clone()
+            } else {
+                let init = self.post(None, &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+                    "protocolVersion":LEGACY_MCP_VERSION,"capabilities":{},"clientInfo":{"name":"Espeon","version":"0.1.2"}}}), None)?;
+                let protocol_version = init
+                    .0
+                    .get("result")
+                    .and_then(|result| result.get("protocolVersion"))
+                    .and_then(Value::as_str)
+                    .context("cTrader MCP initialize response omitted negotiated protocol version")?
+                    .to_owned();
+                let session = LegacySession {
+                    protocol_version,
+                    session_id: init.1,
+                };
+                let _ = self.post(
+                    session.session_id.as_deref(),
+                    &json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+                    Some(&session.protocol_version),
+                )?;
+                *legacy_session = Some(session.clone());
+                session
             };
-            let _ = self.post(
-                session.session_id.as_deref(),
-                &json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
-                Some(&session.protocol_version),
-            )?;
-            *legacy_session = Some(session.clone());
-            session
-        };
-        let response = self
-            .post(
+            let response = self.post(
                 session.session_id.as_deref(),
                 &json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
-            "name":tool,"arguments":arguments}}),
+                    "name":tool,"arguments":arguments}}),
                 Some(&session.protocol_version),
-            )?
-            .0;
-        self.read_tool_result(response, tool)
+            );
+            match response {
+                Ok((response, _)) => return self.read_tool_result(response, tool),
+                Err(error)
+                    if attempt == 0
+                        && had_session
+                        && session.session_id.is_some()
+                        && http_error(&error).is_some_and(|http| http.status == 404) =>
+                {
+                    // cTrader can expire a legacy MCP session while keeping
+                    // the endpoint alive. Discard only the rejected session,
+                    // negotiate a fresh one, and retry this read once.
+                    *legacy_session = None;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        bail!("cTrader MCP legacy session recovery exhausted")
     }
 
     fn read_tool_result(&self, response: Value, tool: &str) -> Result<Value> {
@@ -537,7 +553,10 @@ impl std::fmt::Display for McpHttpError {
         write!(formatter, "HTTP {}", self.status)?;
         if self.body.trim().is_empty() {
             if self.status == 404 {
-                write!(formatter, " (empty response body; MCP endpoint route not found)")
+                write!(
+                    formatter,
+                    " (empty response body; MCP endpoint route not found)"
+                )
             } else {
                 write!(formatter, " (empty response body)")
             }
@@ -877,7 +896,7 @@ fn count_account_records(value: &Value) -> usize {
 
 #[derive(Clone)]
 pub struct McpExecutionValidator {
-    state: Arc<Mutex<HashMap<String, (DateTime<Utc>, f64, f64)>>>,
+    state: Arc<Mutex<HashMap<String, (DateTime<Utc>, DateTime<Utc>, f64, f64, Option<f64>)>>>,
     errors: Arc<Mutex<HashMap<String, String>>>,
 }
 
@@ -886,14 +905,8 @@ impl McpExecutionValidator {
         let client = McpBrokerContext::load(root)?.context(
             "enable cTrader MCP to validate broker account and volume rules before new FIX entries",
         )?;
-        let scales = parse_volume_scales(
-            &std::env::var("CTRADER_FIX_MCP_VOLUME_SCALE").unwrap_or_default(),
-        )?;
-        for symbol in &symbols {
-            if !scales.contains_key(&normalize_symbol(symbol)) {
-                bail!("CTRADER_FIX_MCP_VOLUME_SCALE needs a broker-confirmed entry for {symbol}");
-            }
-        }
+        let open_api = crate::market_data::CTraderOpenApiConfig::load_optional(root)?
+            .context("configure cTrader Open API credentials to discover symbol lot size and volume limits automatically")?;
         let state = Arc::new(Mutex::new(HashMap::new()));
         let errors = Arc::new(Mutex::new(HashMap::new()));
         let validator = Self {
@@ -902,58 +915,86 @@ impl McpExecutionValidator {
         };
         std::thread::Builder::new()
             .name("mcp-account-and-volume-validation".into())
-            .spawn(move || loop {
-                for symbol in &symbols {
-                    match client.fetch_requests(&["symbol_details".into()], Some(symbol)) {
-                        Ok(records) => {
-                            let detail = &records[0]["data"];
-                            let reported = find_key(detail, "symbolName").and_then(Value::as_str);
-                            let minimum = find_key(detail, "minVolume").and_then(number);
-                            let step = find_key(detail, "volumeStep").and_then(number);
-                            if reported.is_some_and(|name| {
-                                normalize_symbol(name) == normalize_symbol(symbol)
-                            }) && minimum.is_some_and(|v| v.is_finite() && v > 0.0)
-                                && step.is_some_and(|v| v.is_finite() && v > 0.0)
-                            {
-                                let scale = scales[&normalize_symbol(symbol)];
-                                let fetched_at = records[0]["dataFetchedAt"]
-                                    .as_str()
-                                    .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
-                                    .map(|value| value.with_timezone(&Utc));
-                                if let Some(fetched_at) = fetched_at {
+            .spawn(move || {
+                let mut cached_rules = None;
+                let mut rules_fetched_at: Option<DateTime<Utc>> = None;
+                loop {
+                    let broker_account_at = match client.fetch_requests(&["account".into()], None) {
+                        Ok(records) => records
+                            .first()
+                            .and_then(|record| record["dataFetchedAt"].as_str())
+                            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                            .map(|value| value.with_timezone(&Utc)),
+                        Err(error) => {
+                            for symbol in &symbols {
+                                errors.lock().insert(symbol.clone(), error.to_string());
+                            }
+                            None
+                        }
+                    };
+                    let rules_expired = rules_fetched_at.map_or(true, |at| {
+                        !crate::freshness::is_fresh(
+                            Utc::now(),
+                            at,
+                            SYMBOL_DETAILS_CACHE_TTL_SECONDS as u64,
+                        )
+                    });
+                    if rules_expired {
+                        match open_api.volume_rules(&symbols) {
+                            Ok(rules) => {
+                                cached_rules = Some(rules);
+                                rules_fetched_at = Some(Utc::now());
+                            }
+                            Err(error) => {
+                                cached_rules = None;
+                                for symbol in &symbols {
+                                    errors.lock().insert(
+                                        symbol.clone(),
+                                        format!("Open API volume metadata unavailable: {error}"),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    match (broker_account_at, cached_rules.as_ref()) {
+                        (Some(account_at), Some(rules)) => {
+                            for symbol in &symbols {
+                                let normalized = normalize_symbol(symbol);
+                                if let Some(rule) = rules.get(&normalized) {
                                     state.lock().insert(
-                                        normalize_symbol(symbol),
+                                        normalized.clone(),
                                         (
-                                            fetched_at,
-                                            minimum.unwrap() * scale,
-                                            step.unwrap() * scale,
+                                            account_at,
+                                            rules_fetched_at.unwrap_or_else(Utc::now),
+                                            rule.minimum_lots,
+                                            rule.step_lots,
+                                            rule.maximum_lots,
                                         ),
                                     );
                                     errors.lock().remove(symbol);
                                 } else {
-                                    state.lock().remove(&normalize_symbol(symbol));
+                                    state.lock().remove(&normalized);
                                     errors.lock().insert(
                                         symbol.clone(),
-                                        "MCP symbol metadata omitted a valid fetch timestamp"
+                                        "cTrader Open API returned no volume rules for this symbol"
                                             .into(),
                                     );
                                 }
-                            } else {
-                                state.lock().remove(&normalize_symbol(symbol));
-                                errors.lock().insert(
-                                    symbol.clone(),
-                                    "MCP symbol metadata lacked matching name/minVolume/volumeStep"
-                                        .into(),
-                                );
                             }
                         }
-                        Err(error) => {
-                            state.lock().remove(&normalize_symbol(symbol));
-                            errors.lock().insert(symbol.clone(), error.to_string());
+                        (None, Some(_)) => {
+                            for symbol in &symbols {
+                                state.lock().remove(&normalize_symbol(symbol));
+                            }
+                        }
+                        (_, None) => {
+                            for symbol in &symbols {
+                                state.lock().remove(&normalize_symbol(symbol));
+                            }
                         }
                     }
+                    std::thread::sleep(Duration::from_secs(15));
                 }
-                std::thread::sleep(Duration::from_secs(15));
             })?;
         Ok(validator)
     }
@@ -961,62 +1002,37 @@ impl McpExecutionValidator {
     pub fn validate_entry(&self, symbol: &str, quantity: f64) -> Result<()> {
         let normalized = normalize_symbol(symbol);
         let state = self.state.lock();
-        let (at, minimum, step) = state.get(&normalized).copied().with_context(|| {
-            self.errors
-                .lock()
-                .get(symbol)
-                .cloned()
-                .unwrap_or_else(|| "MCP account/symbol validation has not completed".into())
-        })?;
-        if !crate::freshness::is_fresh(Utc::now(), at, SYMBOL_DETAILS_CACHE_TTL_SECONDS as u64) {
+        let (account_at, metadata_at, minimum, step, maximum) =
+            state.get(&normalized).copied().with_context(|| {
+                self.errors
+                    .lock()
+                    .get(symbol)
+                    .cloned()
+                    .unwrap_or_else(|| "MCP account/symbol validation has not completed".into())
+            })?;
+        if !crate::freshness::is_fresh(Utc::now(), account_at, 30) {
+            bail!("cTrader MCP account identity snapshot is stale");
+        }
+        if !crate::freshness::is_fresh(
+            Utc::now(),
+            metadata_at,
+            SYMBOL_DETAILS_CACHE_TTL_SECONDS as u64,
+        ) {
             bail!("cTrader broker volume metadata is stale");
         }
         if quantity + 1e-9 < minimum
+            || maximum.is_some_and(|maximum| quantity > maximum + 1e-9)
             || ((quantity - minimum) / step - ((quantity - minimum) / step).round()).abs() > 1e-6
         {
-            bail!("FIX order quantity does not match broker-confirmed minimum and increment");
+            bail!("FIX order quantity does not match cTrader Open API minimum, increment, and maximum");
         }
         Ok(())
     }
 }
 
-fn parse_volume_scales(input: &str) -> Result<HashMap<String, f64>> {
-    let mut scales = HashMap::new();
-    for entry in input
-        .split(',')
-        .map(str::trim)
-        .filter(|entry| !entry.is_empty())
-    {
-        let (symbol, raw_scale) = entry
-            .split_once(':')
-            .context("invalid FIX-to-MCP volume scale mapping")?;
-        let symbol = normalize_symbol(symbol.trim());
-        if symbol.is_empty() {
-            bail!("FIX-to-MCP volume scale mapping has a blank symbol");
-        }
-        let scale: f64 = raw_scale
-            .trim()
-            .parse()
-            .context("invalid FIX-to-MCP volume scale")?;
-        if !scale.is_finite() || scale <= 0.0 {
-            bail!("FIX-to-MCP volume scale must be positive");
-        }
-        if scales.insert(symbol.clone(), scale).is_some() {
-            bail!("duplicate FIX-to-MCP volume scale mapping for {symbol}");
-        }
-    }
-    Ok(scales)
-}
-
 fn normalize_symbol(symbol: &str) -> String {
     symbol.to_ascii_uppercase().replace(['/', '-', '_'], "")
 }
-fn number(value: &Value) -> Option<f64> {
-    value
-        .as_f64()
-        .or_else(|| value.as_str().and_then(|s| s.parse().ok()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1056,18 +1072,6 @@ mod tests {
         .unwrap();
         let error = load_dotenv(directory.path()).unwrap_err();
         assert!(format!("{error:#}").contains("parse cTrader MCP settings"));
-    }
-
-    #[test]
-    fn volume_scale_parser_normalizes_symbol_and_parses_configured_factor() {
-        let scales = parse_volume_scales(" BTC/USD : 0.0000001, ").unwrap();
-        assert_eq!(scales.get("BTCUSD"), Some(&1e-7));
-    }
-
-    #[test]
-    fn volume_scale_parser_rejects_duplicate_normalized_symbols() {
-        let error = parse_volume_scales("BTCUSD:0.0000001,BTC/USD:0.0000002").unwrap_err();
-        assert!(format!("{error:#}").contains("duplicate FIX-to-MCP volume scale mapping"));
     }
 
     #[test]
@@ -1325,7 +1329,9 @@ mod tests {
         assert!(!should_fall_back_to_legacy(&empty_not_found));
         assert!(!should_fall_back_to_modern(&empty_not_found));
         assert!(!retryable_mcp_error(&empty_not_found));
-        assert!(empty_not_found.to_string().contains("MCP endpoint route not found"));
+        assert!(empty_not_found
+            .to_string()
+            .contains("MCP endpoint route not found"));
 
         let method_missing = anyhow::Error::new(McpHttpError {
             status: 404,

@@ -34,8 +34,8 @@ impl RetrievalConfig {
         let storage_path = std::env::var("QDRANT_LOCAL_PATH")
             .map(PathBuf::from)
             .unwrap_or_else(|_| runtime_root.join("qdrant"));
-        let configured_collection = std::env::var("QDRANT_COLLECTION")
-            .unwrap_or_else(|_| "jev_context_pool".into());
+        let configured_collection =
+            std::env::var("QDRANT_COLLECTION").unwrap_or_else(|_| "jev_context_pool".into());
         let collection = if configured_collection.ends_with("_evidence_v2") {
             configured_collection
         } else {
@@ -198,10 +198,10 @@ impl QdrantContextPool {
     /// only after every canonical event has been indexed successfully, so a
     /// crash retries the idempotent deterministic point IDs on next launch.
     pub fn rebuild_if_needed(&self, store: &CanonicalStore) -> Result<bool> {
-        let marker = self.config.storage_path.join(format!(
-            ".{}.source-index-v2.ready",
-            self.config.collection
-        ));
+        let marker = self
+            .config
+            .storage_path
+            .join(format!(".{}.source-index-v2.ready", self.config.collection));
         if marker.is_file() {
             return Ok(false);
         }

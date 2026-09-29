@@ -286,14 +286,31 @@ pub struct MarketContextCacheProvider {
     cache: Arc<Cache>,
     feed: Option<CTraderFixQuoteFeed>,
     twelve: Option<TwelveConfig>,
+    open_api: Option<crate::market_data::CTraderOpenApiConfig>,
     rest_throttle: Option<Arc<Mutex<Instant>>>,
 }
 
 impl MarketContextCacheProvider {
     pub fn start(runtime_root: &Path, config_root: &Path, fix: CTraderFixConfig) -> Result<Self> {
-        let twelve = TwelveConfig::load(config_root)?;
-        let cache = Arc::new(Cache::open(runtime_root)?);
         let feed = CTraderFixQuoteFeed::start(fix.clone())?;
+        Self::start_with_feed(runtime_root, config_root, fix, feed)
+    }
+
+    pub fn start_with_feed(
+        runtime_root: &Path,
+        config_root: &Path,
+        fix: CTraderFixConfig,
+        feed: CTraderFixQuoteFeed,
+    ) -> Result<Self> {
+        let twelve = TwelveConfig::load(config_root)?;
+        let open_api = crate::market_data::CTraderOpenApiConfig::load_optional(config_root)?;
+        let cache = Arc::new(Cache::open(runtime_root)?);
+        if open_api.is_none() {
+            cache.set_health(
+                "openapi",
+                "credentials incomplete or invalid; optional source disabled, Twelve Data and FIX fallbacks remain available".into(),
+            );
+        }
         let symbols = CTraderFixQuoteFeed::configured_symbols(&fix);
         for symbol in &symbols {
             let symbol = symbol.clone();
@@ -340,6 +357,7 @@ impl MarketContextCacheProvider {
             cache,
             feed: Some(feed),
             twelve,
+            open_api,
             rest_throttle,
         })
     }
@@ -392,14 +410,32 @@ impl MarketDataProvider for MarketContextCacheProvider {
                 )?;
             }
         }
+        if let Some(config) = &self.open_api {
+            for series in request
+                .series
+                .iter()
+                .filter(|series| series.source.as_deref() == Some("ctrader-open-api"))
+            {
+                let bars = config.history(&symbol, &series.period, series.bars)?;
+                for bar in bars {
+                    self.cache.insert_bar(bar)?;
+                }
+                self.cache.set_health(
+                    &format!("openapi:{symbol}"),
+                    "historical trendbars available".into(),
+                );
+            }
+        }
         let Some(config) = &self.twelve else {
             return Ok(());
         };
         if request.series.is_empty()
-            || request
-                .series
-                .iter()
-                .all(|series| series.source.as_deref() == Some("ctrader-fix-price-only"))
+            || request.series.iter().all(|series| {
+                matches!(
+                    series.source.as_deref(),
+                    Some("ctrader-fix-price-only" | "ctrader-open-api")
+                )
+            })
         {
             return Ok(());
         }
@@ -554,20 +590,28 @@ impl MarketDataProvider for MarketContextCacheProvider {
             let source = requirement.source.as_deref().unwrap_or("auto");
             let mut candidate = None;
             let choices = if source == "auto" {
-                vec!["twelve-data-rest", "ctrader-fix-price-only"]
+                vec![
+                    "ctrader-open-api",
+                    "twelve-data-rest",
+                    "ctrader-fix-price-only",
+                ]
             } else {
                 vec![source]
             };
             let mut progress = Vec::new();
             for choice in choices {
-                let bars = series_from_minutes(
-                    &state,
-                    &symbol,
-                    choice,
-                    &requirement.period,
-                    requirement.bars,
-                    now,
-                );
+                let bars = if choice == "ctrader-open-api" {
+                    series_from_period(&state, &symbol, &requirement.period, requirement.bars, now)
+                } else {
+                    series_from_minutes(
+                        &state,
+                        &symbol,
+                        choice,
+                        &requirement.period,
+                        requirement.bars,
+                        now,
+                    )
+                };
                 if bars.len() >= requirement.bars {
                     candidate = Some(bars);
                     break;
@@ -619,6 +663,11 @@ impl MarketDataProvider for MarketContextCacheProvider {
             "fix-price-only"
         } else if selected
             .iter()
+            .any(|bar| bar.provenance == "ctrader-open-api-historical-trendbar")
+        {
+            "ctrader-open-api-historical"
+        } else if selected
+            .iter()
             .any(|bar| bar.provenance == "twelve-data-rest")
         {
             if state
@@ -654,6 +703,34 @@ impl MarketDataProvider for MarketContextCacheProvider {
             quality_state: quality_state.into(),
         })
     }
+}
+
+fn series_from_period(
+    state: &CacheState,
+    symbol: &str,
+    period: &MarketDataPeriod,
+    count: usize,
+    now: DateTime<Utc>,
+) -> Vec<Candle> {
+    let mut bars = state
+        .bars
+        .iter()
+        .filter(|((bar_symbol, source, _), bar)| {
+            bar_symbol == symbol
+                && source == "ctrader-open-api-historical-trendbar"
+                && &bar.period == period
+                && valid_bar(bar, now)
+        })
+        .map(|(_, bar)| bar.clone())
+        .collect::<Vec<_>>();
+    bars.sort_by_key(|bar| bar.open_time);
+    bars.into_iter()
+        .rev()
+        .take(count)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
 }
 
 fn series_from_minutes(
@@ -1374,6 +1451,7 @@ mod tests {
             cache: Arc::new(cache),
             feed: None,
             twelve: None,
+            open_api: None,
             rest_throttle: None,
         };
         assert!(provider
@@ -1388,6 +1466,7 @@ mod tests {
             cache: Arc::new(Cache::open(temp.path()).unwrap()),
             feed: None,
             twelve: None,
+            open_api: None,
             rest_throttle: None,
         };
         assert!(restored
@@ -1495,6 +1574,7 @@ mod tests {
             cache: Arc::clone(&cache),
             feed: None,
             twelve: None,
+            open_api: None,
             rest_throttle: None,
         };
         assert_eq!(

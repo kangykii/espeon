@@ -32,6 +32,7 @@ impl Default for ContractState {
 #[serde(rename_all = "snake_case")]
 pub enum ContextSource {
     CTraderFix,
+    CTraderOpenApi,
     TwelveDataRest,
     CanonicalEvidence,
     CTraderMcpReadOnly,
@@ -408,6 +409,7 @@ pub fn context_requirements_from_live_spec(
         let source = match source {
             "twelve-data-rest" => ContextSource::TwelveDataRest,
             "ctrader-fix-price-only" => ContextSource::CTraderFix,
+            "ctrader-open-api" => ContextSource::CTraderOpenApi,
             _ => bail!("unsupported live-series source {source}"),
         };
         requirements.push(ContextRequirement {
@@ -559,8 +561,10 @@ pub fn validate_contract(
             (ContextSource::CTraderFix, ContextValueType::Quote)
                 | (ContextSource::CTraderFix, ContextValueType::Candle)
                 | (ContextSource::TwelveDataRest, ContextValueType::Candle)
+                | (ContextSource::CTraderOpenApi, ContextValueType::Candle)
                 | (ContextSource::CTraderFix, ContextValueType::Indicator)
                 | (ContextSource::TwelveDataRest, ContextValueType::Indicator)
+                | (ContextSource::CTraderOpenApi, ContextValueType::Indicator)
                 | (ContextSource::CTraderMcpReadOnly, ContextValueType::Account)
                 | (
                     ContextSource::CTraderMcpReadOnly,
@@ -636,6 +640,7 @@ pub fn validate_contract(
                     (&item.source, series.source.as_deref()),
                     (ContextSource::TwelveDataRest, Some("twelve-data-rest"))
                         | (ContextSource::CTraderFix, Some("ctrader-fix-price-only"))
+                        | (ContextSource::CTraderOpenApi, Some("ctrader-open-api"))
                         | (ContextSource::TwelveDataRest, None)
                 )
         });
@@ -661,6 +666,7 @@ pub fn validate_contract(
         ))?;
         let requested_source = match requirement.source {
             ContextSource::CTraderFix => Some("ctrader-fix-price-only"),
+            ContextSource::CTraderOpenApi => Some("ctrader-open-api"),
             ContextSource::TwelveDataRest => Some("twelve-data-rest"),
             _ => None,
         };
@@ -1081,13 +1087,17 @@ pub fn explicit_user_timeframe_minutes(objective: &str) -> Result<Option<u64>> {
         let nearby_start = amount_index.saturating_sub(4);
         let nearby_end = (unit_index + 3).min(tokens.len());
         let nearby = &tokens[nearby_start..nearby_end];
+        // Candle intervals (for example, "within the next three 1-minute
+        // candles") are data lookbacks, not competing run horizons. First
+        // establish that this duration is being used as a strategy horizon;
+        // only then apply range/alternative rejection.
+        if !exact_horizon_cue(&tokens, amount_index, unit_index + 1, &candle_cues) {
+            continue;
+        }
         if has_ambiguous_timeframe_quantity(&tokens, amount_index)
             || has_timeframe_range_cue(nearby)
         {
             bail!("explicit strategy timeframe is a range or alternative; one exact horizon is required");
-        }
-        if !exact_horizon_cue(&tokens, amount_index, unit_index + 1, &candle_cues) {
-            continue;
         }
         let scaled_minutes = numerator as f64 * multiplier as f64 / denominator as f64;
         if !scaled_minutes.is_finite() || scaled_minutes.fract().abs() > 1e-9 {
@@ -1218,6 +1228,15 @@ fn has_direct_horizon_cue_before(tokens: &[String], amount_index: usize) -> bool
         return false;
     };
     if matches!(previous, "for" | "over" | "next" | "horizon" | "duration") {
+        return true;
+    }
+    // Accept natural phrasing such as "for this 3-hour experiment" while
+    // keeping ordinary candle periods ("three 1-minute candles") excluded by
+    // exact_horizon_cue's candle-interval check.
+    if matches!(previous, "this" | "the")
+        && amount_index >= 2
+        && matches!(tokens[amount_index - 2].as_str(), "for" | "over")
+    {
         return true;
     }
     if previous == "timeframe"

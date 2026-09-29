@@ -107,7 +107,7 @@ export type ConnectorField = {
   key: string;
   label: string;
   value: string;
-  kind: "text" | "secret";
+  kind: "text" | "secret" | "boolean";
   configured: boolean;
   required: boolean;
   placeholder: string;

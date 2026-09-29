@@ -50,6 +50,11 @@ export const harnessService = {
     return invoke("start_run", { thesis, continuationFromRunId });
   },
 
+  steerRun(runId: string, instruction: string): Promise<RunSnapshot> {
+    if (!isTauri) return Promise.reject(new Error("Steer runs from the Tauri desktop application."));
+    return invoke("steer_run", { runId, instruction });
+  },
+
   stopRun(runId: string): Promise<RunSnapshot> {
     if (!isTauri) return Promise.reject(new Error("Stop runs from the Tauri desktop application."));
     return invoke("stop_run", { runId });
@@ -90,8 +95,6 @@ export const harnessService = {
     depositCurrency: string;
     accountOpenExposure: number;
     quoteToDeposit: number;
-    volumeMinimum: number | null;
-    volumeStep: number | null;
     confirmed: boolean;
   }): Promise<RunSnapshot> {
     if (!isTauri) return Promise.reject(new Error("Live risk verification is available in the desktop application."));
@@ -105,8 +108,6 @@ export const harnessService = {
       depositCurrency: input.depositCurrency,
       accountOpenExposure: input.accountOpenExposure,
       quoteToDeposit: input.quoteToDeposit,
-      volumeMinimum: input.volumeMinimum,
-      volumeStep: input.volumeStep,
       confirmed: input.confirmed,
     });
   },

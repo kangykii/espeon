@@ -62,10 +62,10 @@ const CONNECTOR_FIELDS: &[(&str, &str, &str, bool, bool, &str)] = &[
     (
         "updates",
         "ESPEON_GITHUB_TOKEN",
-        "GitHub token (Contents: read)",
+        "Optional GitHub release token",
         true,
         false,
-        "Fine-grained token for private Espeon releases",
+        "Not required for public releases; optional for higher API rate limits",
     ),
     (
         "autonomous-review",
@@ -230,7 +230,7 @@ const CONNECTOR_FIELDS: &[(&str, &str, &str, bool, bool, &str)] = &[
     (
         "ctrader-mcp",
         "CTRADER_MCP_ENABLED",
-        "Enable read-only MCP",
+        "Enable local cTrader MCP",
         false,
         false,
         "false",
@@ -238,26 +238,18 @@ const CONNECTOR_FIELDS: &[(&str, &str, &str, bool, bool, &str)] = &[
     (
         "ctrader-mcp",
         "CTRADER_MCP_ENDPOINT",
-        "MCP endpoint",
+        "MCP server URL",
         false,
         false,
-        "Defaults to http://127.0.0.1:9876/mcp/",
+        "http://127.0.0.1:9876/mcp/",
     ),
     (
         "ctrader-mcp",
         "CTRADER_MCP_ACCOUNT_ID",
         "Account ID",
         false,
-        false,
-        "cTrader account ID",
-    ),
-    (
-        "ctrader-mcp",
-        "CTRADER_MCP_ENVIRONMENT",
-        "Account environment",
-        false,
-        false,
-        "demo or live",
+        true,
+        "Account ID or login shown in cTrader",
     ),
     (
         "twelve-data",
@@ -301,6 +293,38 @@ const CONNECTOR_FIELDS: &[(&str, &str, &str, bool, bool, &str)] = &[
     ),
     (
         "ctrader-open-api",
+        "CTRADER_OPEN_API_CLIENT_ID",
+        "Open API client ID",
+        false,
+        false,
+        "From your cTrader Open API app",
+    ),
+    (
+        "ctrader-open-api",
+        "CTRADER_OPEN_API_CLIENT_SECRET",
+        "Open API client secret",
+        true,
+        false,
+        "From your cTrader Open API app",
+    ),
+    (
+        "ctrader-open-api",
+        "CTRADER_OPEN_API_ACCESS_TOKEN",
+        "Open API access token",
+        true,
+        false,
+        "Authorize the selected cTrader account",
+    ),
+    (
+        "ctrader-open-api",
+        "CTRADER_OPEN_API_REFRESH_TOKEN",
+        "Open API refresh token",
+        true,
+        false,
+        "Save the refresh token returned with your access token",
+    ),
+    (
+        "ctrader-open-api",
         "CTRADER_MARKET_QUOTE_MAX_AGE_SECONDS",
         "Quote maximum age seconds",
         false,
@@ -314,14 +338,6 @@ const CONNECTOR_FIELDS: &[(&str, &str, &str, bool, bool, &str)] = &[
         false,
         false,
         "250",
-    ),
-    (
-        "fix-common",
-        "CTRADER_FIX_MCP_VOLUME_SCALE",
-        "FIX quantity per MCP volume unit",
-        false,
-        true,
-        "BTCUSD:<broker-confirmed factor>",
     ),
     (
         "fix-common",
@@ -646,8 +662,8 @@ pub fn load_connector_settings(project_root: &Path) -> Result<ConnectorSettings>
     let sections = [
         (
             "updates",
-            "Private updates",
-            "Read-only GitHub access for signed Espeon releases. An authenticated GitHub CLI also works.",
+            "Signed updates",
+            "Public signed Espeon releases install without a GitHub token. A token is optional for higher API rate limits.",
         ),
         (
             "world-model",
@@ -667,7 +683,12 @@ pub fn load_connector_settings(project_root: &Path) -> Result<ConnectorSettings>
         (
             "ctrader-mcp",
             "cTrader MCP",
-            "Read-only broker research and symbol metadata. Local MCP authenticates through the active cTrader Desktop session; no bearer token is used.",
+            "Set the local server and cTrader account ID. Environment is inferred from the FIX session and checked against the active MCP account.",
+        ),
+        (
+            "ctrader-open-api",
+            "cTrader Open API",
+            "Historical broker candles and tick volume. Espeon discovers the authorized account and symbol IDs, and rotates saved tokens on startup.",
         ),
         (
             "twelve-data",
@@ -677,7 +698,7 @@ pub fn load_connector_settings(project_root: &Path) -> Result<ConnectorSettings>
         (
             "fix-common",
             "FIX execution",
-            "Shared FIX settings. Demo symbols with an explicit fixed quantity use that bounded unit when account-risk data is unavailable; live entries still require a fresh risk snapshot.",
+            "Shared FIX settings. Set the intended trade quantity; cTrader Open API supplies symbol lot size and broker quantity limits.",
         ),
         (
             "fix-price",
@@ -687,7 +708,7 @@ pub fn load_connector_settings(project_root: &Path) -> Result<ConnectorSettings>
         (
             "fix-trade",
             "FIX trade session",
-            "Order and position connection used by the harness. One-cycle manual verification is available when live account or volume metadata cannot be fetched.",
+            "Order and position connection used by the harness. Symbol lot size and min/step/max volumes are discovered from cTrader Open API.",
         ),
     ]
     .into_iter()
@@ -700,7 +721,11 @@ pub fn load_connector_settings(project_root: &Path) -> Result<ConnectorSettings>
             .filter(|field| field.0 == id)
             .map(|(_, key, label, secret, required, placeholder)| {
                 let configured = if *key == "CTRADER_MCP_ENABLED" {
-                    values.get(*key).is_some_and(|value| value.eq_ignore_ascii_case("true"))
+                    values
+                        .get(*key)
+                        .is_some_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "true" | "false"))
+                } else if *key == "CTRADER_MCP_ENDPOINT" {
+                    true
                 } else {
                     usable(values.get(*key))
                 };
@@ -709,6 +734,18 @@ pub fn load_connector_settings(project_root: &Path) -> Result<ConnectorSettings>
                     label: (*label).to_owned(),
                     value: if *secret {
                         String::new()
+                    } else if *key == "CTRADER_MCP_ENDPOINT" {
+                        values
+                            .get(*key)
+                            .filter(|value| usable(Some(value)))
+                            .cloned()
+                            .unwrap_or_else(|| "http://127.0.0.1:9876/mcp/".to_owned())
+                    } else if *key == "CTRADER_MCP_ENABLED" {
+                        values
+                            .get(*key)
+                            .map(|value| value.to_ascii_lowercase())
+                            .filter(|value| matches!(value.as_str(), "true" | "false"))
+                            .unwrap_or_else(|| "false".into())
                     } else {
                         values
                             .get(*key)
@@ -716,7 +753,14 @@ pub fn load_connector_settings(project_root: &Path) -> Result<ConnectorSettings>
                             .cloned()
                             .unwrap_or_default()
                     },
-                    kind: if *secret { "secret" } else { "text" }.to_owned(),
+                    kind: if *key == "CTRADER_MCP_ENABLED" {
+                        "boolean"
+                    } else if *secret {
+                        "secret"
+                    } else {
+                        "text"
+                    }
+                    .to_owned(),
                     configured,
                     required: *required,
                     placeholder: if *secret && configured {
@@ -769,8 +813,25 @@ pub fn save_connector_settings(
 
     let env_path = project_root.join(".env");
     let existing = fs::read_to_string(&env_path).unwrap_or_default();
-    let saved_values = env_file_values(project_root)?;
     let mut pending = update.values;
+    let saved_values = env_file_values(project_root)?;
+    let derive_environment = |key: &str| {
+        pending
+            .get(key)
+            .or_else(|| saved_values.get(key))
+            .and_then(|value| value.split('.').next())
+            .map(str::trim)
+            .filter(|environment| {
+                environment.eq_ignore_ascii_case("demo") || environment.eq_ignore_ascii_case("live")
+            })
+            .map(str::to_ascii_lowercase)
+    };
+    let derived_environment = derive_environment("CTRADER_FIX_TRADE_SENDER_COMP_ID")
+        .or_else(|| derive_environment("CTRADER_FIX_PRICE_SENDER_COMP_ID"));
+    drop(derive_environment);
+    if let Some(environment) = derived_environment {
+        pending.insert("CTRADER_MCP_ENVIRONMENT".into(), environment);
+    }
     let secret_keys: std::collections::HashSet<&str> = CONNECTOR_FIELDS
         .iter()
         .filter(|field| field.3)
@@ -829,6 +890,51 @@ pub fn save_connector_settings(
     Ok(settings)
 }
 
+/// Persist cTrader's rotated Open API token pair without rewriting unrelated
+/// connector settings. cTrader invalidates the previous refresh token when it
+/// issues a replacement, so both values must be saved together.
+pub(crate) fn persist_open_api_tokens(
+    project_root: &Path,
+    access_token: &str,
+    refresh_token: &str,
+    expires_at: i64,
+) -> Result<()> {
+    let env_path = project_root.join(".env");
+    let existing = fs::read_to_string(&env_path).unwrap_or_default();
+    let pending = HashMap::from([
+        ("CTRADER_OPEN_API_ACCESS_TOKEN", access_token.to_owned()),
+        ("CTRADER_OPEN_API_REFRESH_TOKEN", refresh_token.to_owned()),
+        (
+            "CTRADER_OPEN_API_ACCESS_TOKEN_EXPIRES_AT",
+            expires_at.to_string(),
+        ),
+    ]);
+    let mut written = std::collections::HashSet::new();
+    let mut output = Vec::new();
+    for line in existing.lines() {
+        let Some((raw_key, _)) = line.split_once('=') else {
+            output.push(line.to_owned());
+            continue;
+        };
+        let key = raw_key.trim();
+        if let Some(value) = pending.get(key) {
+            if written.insert(key.to_owned()) {
+                output.push(format!("{key}={}", encode_dotenv_value(value)?));
+            }
+        } else {
+            output.push(line.to_owned());
+        }
+    }
+    for (key, value) in pending {
+        if written.contains(key) {
+            continue;
+        }
+        output.push(format!("{key}={}", encode_dotenv_value(&value)?));
+    }
+    fs::write(&env_path, format!("{}\n", output.join("\n")))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -865,7 +971,7 @@ mod tests {
         fs::write(
             directory.path().join(".env"),
             format!(
-                "CTRADER_MCP_ENDPOINT=http://old.invalid/mcp/\nCTRADER_MCP_ENDPOINT=http://current.invalid/mcp/\nCTRADER_MCP_AUTH_TOKEN={}\nKEEP_THIS=value\n",
+                "CTRADER_MCP_ENDPOINT=http://old.invalid/mcp/\nCTRADER_MCP_ENDPOINT=http://current.invalid/mcp/\nCTRADER_OPEN_API_ACCESS_TOKEN={}\nKEEP_THIS=value\n",
                 encode_dotenv_value(secret).unwrap()
             ),
         )
@@ -882,7 +988,7 @@ mod tests {
                         "CTRADER_MCP_ENDPOINT".into(),
                         "http://updated.invalid/mcp/".into(),
                     ),
-                    ("CTRADER_MCP_AUTH_TOKEN".into(), String::new()),
+                    ("CTRADER_OPEN_API_ACCESS_TOKEN".into(), String::new()),
                 ]),
             },
         )
@@ -893,7 +999,7 @@ mod tests {
             parsed.get("CTRADER_MCP_ENDPOINT").unwrap(),
             "http://updated.invalid/mcp/"
         );
-        assert_eq!(parsed.get("CTRADER_MCP_AUTH_TOKEN").unwrap(), secret);
+        assert_eq!(parsed.get("CTRADER_OPEN_API_ACCESS_TOKEN").unwrap(), secret);
         assert_eq!(parsed.get("KEEP_THIS").unwrap(), "value");
         let file = fs::read_to_string(directory.path().join(".env")).unwrap();
         assert_eq!(

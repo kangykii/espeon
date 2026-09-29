@@ -8,7 +8,7 @@ import { harnessService } from "./services/harness";
 import { bindWindowChrome } from "./windowChrome";
 import { icons, renderIcons } from "./icons";
 import { renderPositionsChart, type PnlRange } from "./positionsChart";
-import type { ConnectorSettings, ConnectorSettingsUpdate, ContextRecord, Decision, EventView, Hypothesis, LoopView, ReplayState, RunSnapshot, SearchHit, UpdateStatus, WorkspaceSnapshot } from "./types";
+import type { ConnectorSection, ConnectorSettings, ConnectorSettingsUpdate, ContextRecord, Decision, EventView, Hypothesis, LoopView, ReplayState, RunSnapshot, SearchHit, UpdateStatus, WorkspaceSnapshot } from "./types";
 
 type Tab = "home" | "activity" | "positions" | "evidence" | "history";
 type Theme = "light" | "dark";
@@ -60,6 +60,51 @@ function latestDecision(loopId: string): Decision | null { return [...(state.rep
 function positionFor(loopId: string) { return [...(state.replay?.positions ?? currentSnapshot()?.positions ?? [])].reverse().find((item) => item.loopId === loopId) ?? null; }
 function selectedEvidence(): ContextRecord | null { const records = state.replay?.contextPoolRecords ?? []; return records.find((item) => item.id === state.selectedEvidenceId || item.canonicalEntityId === state.selectedEvidenceId) ?? null; }
 
+function readableContextValue(value: unknown): string {
+  if (typeof value === "boolean") return value ? "Yes" : "No";
+  if (typeof value === "number") return Number.isFinite(value) ? new Intl.NumberFormat(undefined, { maximumFractionDigits: 8 }).format(value) : String(value);
+  if (value === null || value === undefined || value === "") return "Not available";
+  if (typeof value === "string") return value;
+  return JSON.stringify(value);
+}
+
+function contextOperand(value: unknown): string {
+  if (typeof value === "string" || typeof value === "number") return String(value);
+  if (!value || typeof value !== "object" || Array.isArray(value)) return "the recorded value";
+  const node = value as Record<string, unknown>;
+  const op = String(node.op ?? "");
+  if (op === "current_mid") return "the current market midpoint";
+  if (op === "current_bid") return "the current bid price";
+  if (op === "current_ask") return "the current ask price";
+  if (op === "series") {
+    const period = String(node.period ?? "market");
+    const column = String(node.column ?? "value").replaceAll("_", " ");
+    const lag = Number(node.lag ?? 0);
+    const relative = lag === 0 ? "latest" : lag === 1 ? "previous" : `${lag} bars earlier`;
+    return `the ${relative} ${period} candle ${column}`;
+  }
+  if (op === "constant") return String(node.value ?? "the recorded constant");
+  return op ? op.replaceAll("_", " ") : "the recorded value";
+}
+
+function contextFormulaDescription(value: Record<string, unknown>): string {
+  const op = String(value.op ?? "");
+  const left = contextOperand(value.left);
+  const right = contextOperand(value.right);
+  const relations: Record<string, string> = {
+    greater_than: "is above", greater_than_or_equal: "is at or above",
+    less_than: "is below", less_than_or_equal: "is at or below",
+    equal: "matches", equals: "matches", not_equal: "does not match",
+  };
+  if (relations[op]) return `${left[0]?.toUpperCase() ?? ""}${left.slice(1)} ${relations[op]} ${right}.`;
+  if (op === "and" || op === "or") {
+    const conjunction = op === "and" ? "and" : "or";
+    return `${contextFormulaDescription((value.left as Record<string, unknown>) ?? {})} ${conjunction} ${contextFormulaDescription((value.right as Record<string, unknown>) ?? {})}`;
+  }
+  if (op === "series" || op.startsWith("current_")) return `${contextOperand(value)} is used as the context value.`;
+  return `Context is calculated using ${op.replaceAll("_", " ") || "the recorded rule"}.`;
+}
+
 function liveContextSection(decision: Decision | null): string {
   const snapshot = decision?.resolvedState.liveContextSnapshot;
   const symbol = hypothesisFor(selectedLoop())?.instruments[0] ?? "";
@@ -69,7 +114,7 @@ function liveContextSection(decision: Decision | null): string {
     return `<section class="inspector-section"><h3>Live market context</h3><p class="muted">No resolved live snapshot yet. A missing or stale feed skips Jev and is recorded in Activity.</p>${healthRows}</section>`;
   }
   const latest = [...snapshot.candles].sort((a, b) => b.openTime.localeCompare(a.openTime))[0];
-  const formulaRows = snapshot.fields.map((field) => `<div class="context-item"><strong>${escapeHtml(field.label)}</strong><span>${escapeHtml(String(field.value))}</span><small>${escapeHtml(JSON.stringify(field.formula))}</small><time>${dateTime(field.observedAt)} · ${escapeHtml(field.provenance.join(", "))} · ${escapeHtml((field.sourceObservationIds ?? []).map(shortId).join(", "))}</time></div>`).join("");
+  const formulaRows = snapshot.fields.map((field) => `<article class="context-item"><strong>${escapeHtml(field.label)}</strong><span class="context-value">${escapeHtml(readableContextValue(field.value))}</span><p class="context-explanation">${escapeHtml(contextFormulaDescription(field.formula))}</p><time>Observed ${dateTime(field.observedAt)} · ${field.provenance.length} source${field.provenance.length === 1 ? "" : "s"}</time><details class="context-technical"><summary>Formula and source details</summary><p>Exact formula</p><pre>${escapeHtml(JSON.stringify(field.formula, null, 2))}</pre><p>Provenance</p><ul>${field.provenance.map((source) => `<li>${escapeHtml(source)}</li>`).join("") || "<li>None recorded</li>"}</ul><p>Source observation IDs</p><ul>${(field.sourceObservationIds ?? []).map((id) => `<li><code>${escapeHtml(id)}</code></li>`).join("") || "<li>None recorded</li>"}</ul></details></article>`).join("");
   return `<section class="inspector-section"><h3>Live market context</h3><dl>${definitionRow("Snapshot", shortId(snapshot.id), true)}${definitionRow("Freshness", snapshot.freshnessState)}${definitionRow("Data route", snapshot.qualityState ?? "legacy")}${definitionRow("Bid / Ask", `${snapshot.quote.bid} / ${snapshot.quote.ask}`)}${definitionRow("Mid / Spread", `${snapshot.quote.mid} / ${snapshot.quote.spread}`)}${definitionRow("Quote received", dateTime(snapshot.quote.receivedAt))}${definitionRow("Latest closed bar", latest ? `${latest.period} · ${dateTime(latest.openTime)} · O ${latest.open} H ${latest.high} L ${latest.low} C ${latest.close}` : "None")}${definitionRow("Bar source", latest?.provenance)}${definitionRow("Volume measure", latest?.volumeKind ?? "legacy")}${definitionRow("Provider volume", latest?.providerVolume ?? "unavailable")}</dl>${formulaRows}<h3>Feed services</h3>${healthRows}</section>`;
 }
 function statusChip(value: string, label = value): string {
@@ -150,7 +195,7 @@ function eventDetails(event: EventView): string {
   const decision = state.replay?.decisions.find((item) => item.id === event.aggregateId);
   if (decision) return `<div class="structured-line"><span>Action</span><strong>${escapeHtml(decision.action)}</strong><span>Confidence</span><strong>${(decision.confidence * 100).toFixed(0)}%</strong></div><p>${escapeHtml(decision.rationale)}</p>`;
   const execution = state.replay?.executions.find((item) => item.executionId === event.aggregateId);
-  if (execution) return `<div class="structured-line"><span>Status</span><strong>${escapeHtml(execution.status)}</strong><span>Fill</span><strong>${execution.filledQuantity} @ ${execution.averagePrice ?? "—"}</strong></div>${execution.rejectionReason ? `<p>${escapeHtml(execution.rejectionReason)}</p>` : ""}`;
+  if (execution) return `<div class="structured-line"><span>Status</span><strong>${escapeHtml(execution.status)}</strong><span>Lots</span><strong>${execution.filledQuantity} @ ${execution.averagePrice ?? "—"}</strong></div>${execution.rejectionReason ? `<p>${escapeHtml(execution.rejectionReason)}</p>` : ""}`;
   const review = state.replay?.hypothesisReviews.find((item) => item.id === event.aggregateId);
   if (review) return `<div class="structured-line"><span>Action</span><strong>${escapeHtml(review.action.toUpperCase())}</strong><span>Route</span><strong>${review.routing?.escalated ? "Escalated" : "Base model"}</strong></div><p>${escapeHtml(review.diagnosis || review.rationale)}</p><p>${escapeHtml(review.continuationRationale || review.rationale)}</p>`;
   const trigger = [...(state.replay?.autonomousReviewTriggers ?? [])].reverse().find((item) => item.triggerId === event.aggregateId);
@@ -160,25 +205,105 @@ function eventDetails(event: EventView): string {
   return event.summary ? `<p>${escapeHtml(event.summary)}</p>` : "";
 }
 
+type MarketPathStep = { label: string; state: "done" | "current" | "pending" | "blocked" | "skipped"; detail: string };
+
 function marketWarmupBanner(events: EventView[]): string {
   if (currentSnapshot()?.status !== "active") return "";
   const contextEvent = [...events].reverse().find((event) => event.kind === "live_context_resolution_failed" || event.kind === "live_context_resolved");
-  if (!contextEvent) {
-    return `<section class="market-warmup" data-state="waiting" aria-live="polite"><div class="market-warmup-heading"><span class="market-warmup-badge">PREPARING</span><div><h2>Warming up market data</h2><p>Espeon is collecting a fresh cTrader quote and the required completed candles. Jev and order checks wait until live context is ready.</p></div></div>${marketPath(0)}</section>`;
+  const pending = (label: string): MarketPathStep => ({ label, state: "pending", detail: "Waiting" });
+  const steps: MarketPathStep[] = [
+    { label: "Market data", state: contextEvent ? "done" : "current", detail: contextEvent ? "Fresh feed received" : "Collecting quote and candles" },
+    { label: "Live context", state: contextEvent?.kind === "live_context_resolved" ? "done" : contextEvent?.kind === "live_context_resolution_failed" ? "blocked" : "pending", detail: contextEvent?.kind === "live_context_resolved" ? "Snapshot resolved" : contextEvent?.kind === "live_context_resolution_failed" ? "Snapshot unavailable" : "Waiting" },
+    pending("Jev"), pending("Risk checks"), pending("cTrader FIX"),
+  ];
+  let stateName = "waiting";
+  let badge = "PREPARING";
+  let title = "Warming up market data";
+  let message = "Espeon is collecting a fresh cTrader quote and the required completed candles.";
+
+  if (contextEvent?.kind === "live_context_resolution_failed") {
+    const cadence = contextEvent.loopId ? state.replay?.cadences.find((item) => item.loopId === contextEvent.loopId) : undefined;
+    const seconds = cadence?.jev1IntervalSeconds;
+    const retry = seconds ? `Retrying on the ${seconds >= 60 ? `${Math.round(seconds / 60)}-minute` : `${seconds}-second`} loop cycle.` : "Retrying on the next scheduled loop cycle.";
+    steps[0] = { label: "Market data", state: "blocked", detail: "Feed or candles unavailable" };
+    steps[1] = { label: "Live context", state: "skipped", detail: "Not resolved" };
+    steps[2] = { label: "Jev", state: "skipped", detail: "Not called" };
+    steps[3] = { label: "Risk checks", state: "skipped", detail: "No order" };
+    steps[4] = { label: "cTrader FIX", state: "skipped", detail: "No order sent" };
+    badge = "WAITING";
+    title = "Waiting for market data";
+    message = `${contextEvent.detail || "Required fresh market data is not available."} Jev was not called and no order was sent. ${retry}`;
+  } else if (contextEvent) {
+    const cycleEvents = events.filter((event) => event.sequence > contextEvent.sequence && (!contextEvent.loopId || event.loopId === contextEvent.loopId));
+    const decisionEvent = [...cycleEvents].reverse().find((event) => event.kind === "jev1_decision_recorded" || event.kind === "jev2_decision_recorded");
+    if (!decisionEvent) {
+      steps[2] = { label: "Jev", state: "current", detail: "Waiting for decision" };
+      badge = "READY";
+      title = "Live context is ready for Jev";
+      message = "Fresh live context is recorded. Jev is the next canonical step.";
+    } else {
+      const decision = state.replay?.decisions.find((item) => item.id === decisionEvent.aggregateId);
+      const action = decision?.action ?? "Decision recorded";
+      const noTrade = /no.?trade|hold|wait/i.test(action);
+      steps[2] = { label: "Jev", state: "done", detail: action };
+      if (noTrade) {
+        steps[3] = { label: "Risk checks", state: "skipped", detail: "No trade requested" };
+        steps[4] = { label: "cTrader FIX", state: "skipped", detail: "No order sent" };
+        stateName = "complete";
+        badge = "NO TRADE";
+        title = "Jev chose not to trade";
+        message = decision?.rationale || `Jev recorded ${action}; risk approval and broker execution were not needed.`;
+      } else {
+        const orderEvent = cycleEvents.find((event) => event.kind === "order_evaluated" && event.causationEventId === decisionEvent.id);
+        const guardEvent = cycleEvents.find((event) => event.kind === "guardrail_evaluated" && event.aggregateId === decisionEvent.aggregateId);
+        const order = state.replay?.orders.find((item) => item.decisionId === decisionEvent.aggregateId);
+        const rejected = Boolean(order && (/reject|block|invalid|fail/i.test(order.status) || order.rejectionReasons.length > 0)) || Boolean(guardEvent?.detail?.startsWith("Rejected:"));
+        const reason = order?.rejectionReasons.join("; ") || guardEvent?.detail?.replace(/^Rejected:\s*/, "") || "Deterministic risk policy rejected the order.";
+        if (!orderEvent && !order && !guardEvent) {
+          steps[3] = { label: "Risk checks", state: "current", detail: "Waiting for evaluation" };
+          steps[4] = pending("cTrader FIX");
+          stateName = "progress";
+          badge = "IN PROGRESS";
+          title = "Jev decision recorded";
+          message = `Jev selected ${action}. Waiting for the deterministic risk evaluation.`;
+        } else if (rejected) {
+          steps[3] = { label: "Risk checks", state: "blocked", detail: reason };
+          steps[4] = { label: "cTrader FIX", state: "skipped", detail: "Order blocked; not sent" };
+          stateName = "blocked";
+          badge = "RISK BLOCKED";
+          title = "Risk checks blocked the order";
+          message = reason;
+        } else {
+          const execution = state.replay?.executions.find((item) => item.causedByDecisionId === decisionEvent.aggregateId);
+          steps[3] = { label: "Risk checks", state: "done", detail: "Order approved" };
+          if (!execution) {
+            steps[4] = { label: "cTrader FIX", state: "current", detail: "Waiting for broker result" };
+            stateName = "progress";
+            badge = "IN PROGRESS";
+            title = "Order approved; awaiting cTrader FIX";
+            message = "Deterministic risk checks passed. The card will update when the broker execution is recorded.";
+          } else if (/reject|fail|error/i.test(execution.status) || execution.rejectionReason) {
+            steps[4] = { label: "cTrader FIX", state: "blocked", detail: execution.rejectionReason || execution.status };
+            stateName = "blocked";
+            badge = "BROKER REJECTED";
+            title = "cTrader FIX did not fill the order";
+            message = execution.rejectionReason || `Broker result: ${execution.status}.`;
+          } else {
+            steps[4] = { label: "cTrader FIX", state: "done", detail: `${execution.status} · ${execution.filledQuantity} lots` };
+            stateName = "complete";
+            badge = "RECORDED";
+            title = "Broker result recorded";
+            message = `${execution.status}: ${execution.filledQuantity} lots${execution.averagePrice === null ? "" : ` at ${execution.averagePrice}`}.`;
+          }
+        }
+      }
+    }
   }
-  const ready = contextEvent.kind === "live_context_resolved";
-  const cadence = contextEvent.loopId ? state.replay?.cadences.find((item) => item.loopId === contextEvent.loopId) : undefined;
-  const retrySeconds = cadence?.jev1IntervalSeconds;
-  const retry = retrySeconds ? `The loop checks again on its ${retrySeconds >= 60 ? `${Math.round(retrySeconds / 60)}-minute` : `${retrySeconds}-second`} cycle.` : "The loop will retry on its next scheduled cycle.";
-  const message = ready
-    ? "Fresh live context was resolved. Jev evaluates it next; any order still has to pass deterministic risk checks."
-    : `${contextEvent.detail || "Espeon needs 15 complete, contiguous, fresh M1 candles before it can call Jev."} Jev was skipped; no order was sent. ${retry}`;
-  return `<section class="market-warmup" data-state="${ready ? "ready" : "waiting"}" aria-live="polite"><div class="market-warmup-heading"><span class="market-warmup-badge">${ready ? "READY" : "WARMING UP"}</span><div><h2>${ready ? "Live context is ready for Jev" : "Waiting for market data"}</h2><p>${escapeHtml(message)}</p></div></div>${marketPath(ready ? 1 : 0)}</section>`;
+  return `<section class="market-warmup" data-state="${stateName}" aria-live="polite"><div class="market-warmup-heading"><span class="market-warmup-badge">${escapeHtml(badge)}</span><div><h2>${escapeHtml(title)}</h2><p>${escapeHtml(message)}</p></div></div>${marketPath(steps)}</section>`;
 }
 
-function marketPath(completedThrough: number): string {
-  const steps = ["Market data", "Live context", "Jev", "Risk checks", "cTrader FIX"];
-  return `<ol class="market-warmup-path" aria-label="Trade decision path">${steps.map((step, index) => `<li data-step="${index < completedThrough ? "done" : index === completedThrough ? "current" : "pending"}"><span>${index + 1}</span><strong>${step}</strong></li>`).join("")}</ol>`;
+function marketPath(steps: MarketPathStep[]): string {
+  return `<ol class="market-warmup-path" aria-label="Canonical activity progress">${steps.map((step, index) => `<li data-step="${step.state}" title="${escapeHtml(step.detail)}"><span>${index + 1}</span><div><strong>${escapeHtml(step.label)}</strong><small>${escapeHtml(step.detail)}</small></div></li>`).join("")}</ol>`;
 }
 
 function activityView(): string {
@@ -202,7 +327,7 @@ function positionRows(): string {
 
 function positionsView(): string {
   const executions = state.replay?.executions ?? [];
-  return `<div class="table-section"><div class="content-section-heading"><div><h2>Positions & execution</h2></div><span>${state.replay?.positions.length ?? 0} positions</span></div>${renderPositionsChart(state.replay?.tradeOutcomes ?? [], pnlRange)}<div class="table-wrap"><table><thead><tr><th>Instrument</th><th>State</th><th>Quantity</th><th>Entry</th><th>P&amp;L</th><th>Origin loop</th><th>Broker</th></tr></thead><tbody>${positionRows() || `<tr><td colspan="7" class="table-empty">No positions recorded for this run.</td></tr>`}</tbody></table></div><div class="execution-list"><h3>Execution ledger</h3>${[...executions].reverse().map((item) => `<article class="execution-row"><div>${statusChip(item.status)}<strong>${escapeHtml(item.executionKind)}</strong><span>${escapeHtml(item.action)}</span></div><div><span>${item.filledQuantity} @ ${item.averagePrice ?? "—"}</span><code>${escapeHtml(shortId(item.executionId))}</code><time>${dateTime(item.executedAt)}</time></div>${item.rejectionReason ? `<p>${escapeHtml(item.rejectionReason)}</p>` : ""}</article>`).join("") || `<p class="muted">No broker executions yet.</p>`}</div></div>`;
+  return `<div class="table-section"><div class="content-section-heading"><div><h2>Positions & execution</h2></div><span>${state.replay?.positions.length ?? 0} positions</span></div>${renderPositionsChart(state.replay?.tradeOutcomes ?? [], pnlRange)}<div class="table-wrap"><table><thead><tr><th>Instrument</th><th>State</th><th>Lots</th><th>Entry</th><th>P&amp;L</th><th>Origin loop</th><th>Broker</th></tr></thead><tbody>${positionRows() || `<tr><td colspan="7" class="table-empty">No positions recorded for this run.</td></tr>`}</tbody></table></div><div class="execution-list"><h3>Execution ledger</h3>${[...executions].reverse().map((item) => `<article class="execution-row"><div>${statusChip(item.status)}<strong>${escapeHtml(item.executionKind)}</strong><span>${escapeHtml(item.action)}</span></div><div><span>${item.filledQuantity} lots @ ${item.averagePrice ?? "—"}</span><code>${escapeHtml(shortId(item.executionId))}</code><time>${dateTime(item.executedAt)}</time></div>${item.rejectionReason ? `<p>${escapeHtml(item.rejectionReason)}</p>` : ""}</article>`).join("") || `<p class="muted">No broker executions yet.</p>`}</div></div>`;
 }
 
 function evidenceCard(record: ContextRecord): string {
@@ -246,8 +371,11 @@ function mainPanel(): string {
   const titleView = editingTitle
     ? `<form class="run-title-edit" id="run-title-form"><input id="run-title-input" name="name" value="${escapeHtml(title)}" maxlength="120" required autocomplete="off" aria-label="Trade title"/><button type="submit" class="icon-button" title="Save title" aria-label="Save title">${icons.check}</button><button type="button" class="icon-button" id="cancel-title-edit" title="Cancel" aria-label="Cancel title edit">${icons.close}</button></form>`
     : `<h1 id="run-title" ${state.selectedRunId ? 'title="Double-click to rename"' : ""}>${escapeHtml(title)}</h1>${state.selectedRunId ? `<button class="title-edit-button" id="edit-run-title" type="button" aria-label="Rename trade" title="Rename trade">${icons.rename}</button>` : ""}`;
-  const continuationLabel = state.selectedRunId ? `Continuing from ${shortId(state.selectedRunId)} · history informs a new run` : "World model → Jev → deterministic harness";
-  return `<main class="workbench-main"><header class="workbench-header"><div class="header-title"><div class="run-title-wrap">${titleView}</div></div><div class="header-actions"><nav class="tabs" aria-label="Run views" role="group">${(["activity", "positions", "evidence"] as const).map((tab) => `<button type="button" data-tab="${tab}" aria-pressed="${state.tab === tab}" class="${state.tab === tab ? "is-active" : ""}">${icons[tab === "positions" ? "position" : tab]}<span>${tab[0].toUpperCase() + tab.slice(1)}</span>${tab === "activity" && selectedRunSnapshot() ? `<em>${selectedRunSnapshot()!.events.length}</em>` : ""}</button>`).join("")}</nav>${snapshot ? `<button class="secondary-button danger" id="stop-run" type="button" ${stopping ? "disabled" : ""}>${stopping ? `<span class="spinner small"></span>` : icons.stop}<span>${stopping ? "Stopping…" : "Stop run"}</span></button>` : ""}</div></header>${state.notice ? `<div class="notice" data-tone="${state.noticeTone}"><span>${escapeHtml(state.notice)}</span><button aria-label="Dismiss notice" id="dismiss-notice" type="button">${icons.close}</button></div>` : ""}<section class="workbench-scroll" id="workbench-scroll">${tabContent()}</section><form class="composer" id="run-composer"><div class="composer-shell"><textarea id="thesis-input" rows="2" placeholder="${state.selectedRunId ? "Continue with a new instruction using this run as context…" : "Describe a trading hypothesis or vague market behavior…"}" ${state.loading ? "disabled" : ""}>${escapeHtml(promptDraft)}</textarea><div class="composer-footer"><div><span class="composer-mode">Autonomous</span><span class="composer-detail">${escapeHtml(continuationLabel)}</span></div><button class="send-button" type="submit" title="${state.selectedRunId ? "Continue from this run" : "Start run"} (Ctrl+Enter)">${state.loading ? `<span class="spinner small"></span>` : icons.arrow}</button></div></div></form></main>`;
+  const activeRun = currentSnapshot() !== null;
+  const continuationLabel = activeRun ? "Steering active run · delivered at next Jev decision" : state.selectedRunId ? `Continuing from ${shortId(state.selectedRunId)} · history informs a new run` : "World model → Jev → deterministic harness";
+  const composerPlaceholder = activeRun ? "Steer the active run…" : state.selectedRunId ? "Continue with a new instruction using this run as context…" : "Describe a trading hypothesis or vague market behavior…";
+  const composerAction = activeRun ? "Steer active run" : state.selectedRunId ? "Continue from this run" : "Start run";
+  return `<main class="workbench-main"><header class="workbench-header"><div class="header-title"><div class="run-title-wrap">${titleView}</div></div><div class="header-actions"><nav class="tabs" aria-label="Run views" role="group">${(["activity", "positions", "evidence"] as const).map((tab) => `<button type="button" data-tab="${tab}" aria-pressed="${state.tab === tab}" class="${state.tab === tab ? "is-active" : ""}">${icons[tab === "positions" ? "position" : tab]}<span>${tab[0].toUpperCase() + tab.slice(1)}</span>${tab === "activity" && selectedRunSnapshot() ? `<em>${selectedRunSnapshot()!.events.length}</em>` : ""}</button>`).join("")}</nav>${snapshot ? `<button class="secondary-button danger" id="stop-run" type="button" ${stopping ? "disabled" : ""}>${stopping ? `<span class="spinner small"></span>` : icons.stop}<span>${stopping ? "Stopping…" : "Stop run"}</span></button>` : ""}</div></header>${state.notice ? `<div class="notice" data-tone="${state.noticeTone}"><span>${escapeHtml(state.notice)}</span><button aria-label="Dismiss notice" id="dismiss-notice" type="button">${icons.close}</button></div>` : ""}<section class="workbench-scroll" id="workbench-scroll">${tabContent()}</section><form class="composer" id="run-composer"><div class="composer-shell"><textarea id="thesis-input" rows="2" placeholder="${composerPlaceholder}" ${state.loading ? "disabled" : ""}>${escapeHtml(promptDraft)}</textarea><div class="composer-footer"><div><span class="composer-mode">Autonomous</span><span class="composer-detail">${escapeHtml(continuationLabel)}</span></div><button class="send-button" type="submit" title="${composerAction} (Ctrl+Enter)">${state.loading ? `<span class="spinner small"></span>` : icons.arrow}</button></div></div></form></main>`;
 }
 
 function definitionRow(label: string, value: unknown, mono = false): string { return `<div class="definition-row"><dt>${escapeHtml(label)}</dt><dd class="${mono ? "mono" : ""}">${escapeHtml(value ?? "—")}</dd></div>`; }
@@ -280,7 +408,7 @@ function inspector(): string {
   const metrics = loop ? liveReviewMetrics(loop) : null;
   const reviewSection = loop && metrics ? `<section class="inspector-section"><h3>Autonomous review</h3>${reviewTrigger ? `<div class="decision-callout"><div><strong>${escapeHtml(reviewTrigger.status)}</strong><span>${escapeHtml(reviewTrigger.kinds.join(" · ").replaceAll("_", " "))}</span></div>${review ? `<p>${escapeHtml(review.diagnosis || review.rationale)}</p>` : `<p>Deterministic counters are tracking the next model review.</p>`}</div>` : `<p class="muted">Monitoring canonical Jev decisions and completed broker round trips.</p>`}<dl>${definitionRow("No-trade", `${metrics.noTrade} / ${reviewTrigger?.noTradeThreshold ?? metrics.noTradeThreshold}`)}${definitionRow("Consecutive losses", `${metrics.losses} / ${reviewTrigger?.lossThreshold ?? 3}`)}${definitionRow("Completed trades", `${metrics.trades} / ${reviewTrigger?.periodicTradeThreshold ?? 10}`)}${definitionRow("Review state", reviewTrigger?.status ?? "monitoring")}${definitionRow("Model route", review?.routing ? (review.routing.escalated ? `Escalated · ${review.routing.selectedModel}` : `Base · ${review.routing.selectedModel}`) : "—")}${definitionRow("Action", review?.action?.toUpperCase())}${definitionRow("Severity", review?.problemSeverity)}</dl></section>` : "";
   const evidenceContent = evidence ? `<section class="inspector-section"><div class="source-heading">${statusChip(evidence.trustLevel)}<span>${escapeHtml(evidence.sourceClass)}</span></div><h3>${escapeHtml(evidence.title)}</h3><p class="inspector-copy">${escapeHtml(evidence.text)}</p>${evidence.provenanceUri.startsWith("http") ? `<a class="source-link" href="${escapeHtml(evidence.provenanceUri)}" target="_blank" rel="noreferrer">Open source ${icons.external}</a>` : ""}</section><section class="inspector-section"><h3>Provenance</h3><dl>${definitionRow("Publisher", evidence.publisher)}${definitionRow("Observed", dateTime(evidence.observedAt))}${definitionRow("Retrieved", dateTime(evidence.ingestedAt))}${definitionRow("Canonical ID", evidence.canonicalEntityId, true)}${definitionRow("Event ID", evidence.canonicalEventId, true)}</dl></section><section class="inspector-section"><h3>Metadata</h3><pre>${escapeHtml(JSON.stringify(evidence.metadata, null, 2))}</pre></section>` : "";
-  const loopContent = loop && hypothesis ? `<section class="inspector-section hero-detail"><div class="loop-title"><span class="loop-state-dot"></span><div><h3>${escapeHtml(hypothesis.instruments.join(" · "))}</h3><p>${loop.parentLoopId ? "Spawned hypothesis" : "Original hypothesis"}</p></div>${statusChip(loop.state)}</div></section><section class="inspector-section"><h3>Hypothesis</h3><p class="inspector-copy">${escapeHtml(hypothesis.strategyMechanism)}</p><dl>${definitionRow("Timeframe", hypothesis.timeframe.label)}${definitionRow("Thesis version", `v${loop.thesisVersion}`)}${definitionRow("Context version", `v${loop.contextVersion}`)}${definitionRow("Loop ID", loop.id, true)}</dl></section><section class="inspector-section"><h3>Latest Jev decision</h3>${decision ? `<div class="decision-callout"><div><strong>${escapeHtml(decision.action)}</strong><span>${(decision.confidence * 100).toFixed(0)}% confidence</span></div><p>${escapeHtml(decision.rationale)}</p></div>` : `<p class="muted">No Jev decision recorded.</p>`}<dl>${definitionRow("Stage", decision?.stage)}${definitionRow("Position", position ? `${position.direction} · ${position.state}` : "Flat")}${definitionRow("Capital allocation", allocation ? `${(allocation.fraction * 100).toFixed(1)}%` : `${(loop.allocatedFraction * 100).toFixed(1)}%`)}</dl></section>${liveContextSection(decision)}${reviewSection}<section class="inspector-section"><h3>Selected context</h3>${context?.items.map((item) => `<div class="context-item"><strong>${escapeHtml(item.sourceId)}</strong><span>${escapeHtml(item.content)}</span><time>${dateTime(item.observedAt)}</time></div>`).join("") || `<p class="muted">No context items available.</p>`}</section>` : "";
+  const loopContent = loop && hypothesis ? `<section class="inspector-section hero-detail"><div class="loop-title"><span class="loop-state-dot"></span><div><h3>${escapeHtml(hypothesis.instruments.join(" · "))}</h3><p>${loop.parentLoopId ? "Spawned hypothesis" : "Original hypothesis"}</p></div>${statusChip(loop.state)}</div></section><section class="inspector-section"><h3>Hypothesis</h3><p class="inspector-copy">${escapeHtml(hypothesis.strategyMechanism)}</p><dl>${definitionRow("Timeframe", hypothesis.timeframe.label)}${definitionRow("Thesis version", `v${loop.thesisVersion}`)}${definitionRow("Context version", `v${loop.contextVersion}`)}${definitionRow("Loop ID", loop.id, true)}</dl></section><section class="inspector-section"><h3>Latest Jev decision</h3>${decision ? `<div class="decision-callout"><div><strong>${escapeHtml(decision.action)}</strong><span>${(decision.confidence * 100).toFixed(0)}% confidence</span></div><p>${escapeHtml(decision.rationale)}</p></div>` : `<p class="muted">No Jev decision recorded.</p>`}<dl>${definitionRow("Stage", decision?.stage)}${definitionRow("Position", position ? `${position.direction} · ${position.state}` : "Flat")}${definitionRow("Capital allocation", allocation ? `${(allocation.fraction * 100).toFixed(1)}%` : `${(loop.allocatedFraction * 100).toFixed(1)}%`)}</dl></section>${liveContextSection(decision)}${reviewSection}<section class="inspector-section"><h3>Selected context</h3>${context?.items.map((item) => `<article class="context-item"><strong>${escapeHtml(item.source.replaceAll("_", " "))}</strong><span>${escapeHtml(item.content)}</span><time>Observed ${dateTime(item.observedAt)}</time><details class="context-technical"><summary>Source record</summary><dl>${definitionRow("Source type", item.source, true)}${definitionRow("Source ID", item.sourceId, true)}</dl></details></article>`).join("") || `<p class="muted">No context items available.</p>`}</section>` : "";
   const empty = `<section class="empty-inspector"><span>${icons.inspect}</span><h3>Select a Jev loop</h3><p>Loop thesis, context, Jev state, position, confidence, and capital allocation will appear here.</p></section>`;
   return `<div class="resize-handle resize-inspector" aria-hidden="true"></div><aside class="inspector ${preferences.inspectorCollapsed ? "is-collapsed" : ""}"><div class="inspector-header"><div><h2>${evidence ? "Evidence record" : loop ? "Selected Jev loop" : "Run context"}</h2></div><button class="icon-button" id="close-inspector" type="button" aria-label="Close context">${icons.close}</button></div><div class="inspector-scroll">${evidenceContent || loopContent || empty}</div></aside>`;
 }
@@ -289,21 +417,44 @@ function settingsModal(): string {
   if (!state.settingsOpen) return "";
   const settings = state.connectorSettings;
   const pages: { id: string; label: string; title: string; description: string; sections?: string[] }[] = [
-    { id: "overview", label: "Overview", title: "Connection overview", description: "Choose the providers Espeon uses for models, Jev, and execution." },
+    { id: "overview", label: "Quick setup", title: "Quick setup", description: "Choose Espeon’s providers. Open cTrader to set up MCP and Open API together." },
     { id: "models", label: "AI models", title: "AI models", description: "Configure the world model and independent Jev decision engine.", sections: ["world-model", "jev"] },
-    { id: "market", label: "Market data", title: "Market data", description: "Set up optional historical and live price data providers.", sections: ["twelve-data"] },
-    { id: "ctrader", label: "cTrader", title: "cTrader connection", description: "Configure the read-only cTrader MCP connection and account metadata." , sections: ["ctrader-mcp"] },
+    { id: "ctrader", label: "cTrader", title: "cTrader hybrid connection", description: "MCP supplies account context; Open API supplies broker historical bars and tick volume. FIX remains the execution session.", sections: ["ctrader-mcp", "ctrader-open-api"] },
     { id: "execution", label: "Execution & risk", title: "Execution & risk", description: "Review live order readiness and configure FIX price and trade sessions.", sections: ["fix-common", "fix-price", "fix-trade"] },
-    { id: "reviews", label: "Autonomous reviews", title: "Autonomous reviews", description: "Configure review triggers, escalation, and loop limits.", sections: ["autonomous-review"] },
-    { id: "updates", label: "App updates", title: "App updates", description: "Check for Espeon updates and configure private release access.", sections: ["updates"] },
+    { id: "advanced", label: "Advanced", title: "Advanced settings", description: "Optional market data, review policy, and update access.", sections: ["twelve-data", "autonomous-review", "updates"] },
   ];
   const page = pages.find((item) => item.id === settingsPage) ?? pages[0];
   const adapterPanel = !settings ? `<div class="settings-loading"><span class="spinner"></span><p>Loading local connector configuration…</p></div>` : `<section class="settings-adapters"><label><span>World model</span><select name="worldModelAdapter"><option value="openrouter" ${settings.worldModelAdapter === "openrouter" ? "selected" : ""}>OpenRouter</option><option value="simulated" ${settings.worldModelAdapter === "simulated" ? "selected" : ""}>Simulated</option></select></label><label><span>Jev engine</span><select name="jevAdapter"><option value="typesafe" ${settings.jevAdapter === "typesafe" ? "selected" : ""}>TypeSafe Jev</option><option value="simulated" ${settings.jevAdapter === "simulated" ? "selected" : ""}>Simulated</option></select></label><label><span>Execution broker</span><select name="brokerAdapter"><option value="ctrader-fix" ${settings.brokerAdapter === "ctrader-fix" ? "selected" : ""}>cTrader FIX</option><option value="simulated" ${settings.brokerAdapter === "simulated" ? "selected" : ""}>Simulated</option></select></label><p>Provider choices apply after restarting Espeon.</p></section>`;
-  const sections = settings && page.sections ? settings.sections.filter((section) => page.sections?.includes(section.id)).map((section) => `<section class="connector-section"><header><div>${section.title === page.title ? "" : `<h3>${escapeHtml(section.title)}</h3>`}<p>${escapeHtml(section.description)}</p></div><span>${section.fields.filter((field) => field.configured).length}/${section.fields.length} set</span></header><div class="connector-fields">${section.fields.map((field) => `<label class="connector-field"><span>${escapeHtml(field.label)}${field.required ? `<em>required</em>` : ""}</span><div><input name="${escapeHtml(field.key)}" type="${field.kind === "secret" ? "password" : "text"}" value="${escapeHtml(field.value)}" placeholder="${escapeHtml(field.placeholder)}" autocomplete="off" spellcheck="false"/><i data-configured="${field.configured}">${field.configured ? "Stored" : "Not set"}</i></div></label>`).join("")}</div></section>`).join("") : "";
+  const visibleFields = (section: ConnectorSection) => section.fields.filter((field) => ![
+    "CTRADER_MCP_ENVIRONMENT",
+    "CTRADER_MARKET_QUOTE_MAX_AGE_SECONDS",
+    "CTRADER_MARKET_HISTORY_DEPTH",
+    "CTRADER_FIX_HEARTBEAT_SECONDS",
+    "CTRADER_FIX_TIMEOUT_SECONDS",
+    "CTRADER_FIX_RECONNECT_ATTEMPTS",
+    "CTRADER_FIX_PRICE_SENDER_SUB_ID",
+    "CTRADER_FIX_PRICE_TARGET_COMP_ID",
+    "CTRADER_FIX_PRICE_TARGET_SUB_ID",
+    "CTRADER_FIX_TRADE_SENDER_SUB_ID",
+    "CTRADER_FIX_TRADE_TARGET_COMP_ID",
+    "CTRADER_FIX_TRADE_TARGET_SUB_ID",
+  ].includes(field.key));
+  const sections = settings && page.sections ? settings.sections.filter((section) => page.sections?.includes(section.id)).map((section) => {
+    const fields = visibleFields(section);
+    return `<section class="connector-section"><header><div>${section.title === page.title ? "" : `<h3>${escapeHtml(section.title)}</h3>`}<p>${escapeHtml(section.description)}</p></div><span>${fields.filter((field) => field.configured).length}/${fields.length} set</span></header><div class="connector-fields">${fields.map((field) => field.kind === "boolean"
+      ? `<label class="connector-field connector-field-switch"><span>${escapeHtml(field.label)}</span><span class="connector-switch"><input name="${escapeHtml(field.key)}" type="checkbox" role="switch" aria-label="${escapeHtml(field.label)}" ${field.value === "true" ? "checked" : ""}/><span class="connector-switch-track"></span><i>${field.value === "true" ? "On" : "Off"}</i></span></label>`
+      : `<label class="connector-field"><span>${escapeHtml(field.label)}${field.required ? `<em>required</em>` : ""}</span><div><input name="${escapeHtml(field.key)}" type="${field.kind === "secret" ? "password" : "text"}" value="${escapeHtml(field.value)}" placeholder="${escapeHtml(field.placeholder)}" autocomplete="off" spellcheck="false"/><i data-configured="${field.configured}">${field.configured ? "Stored" : "Not set"}</i></div></label>`).join("")}</div></section>`;
+  }).join("") : "";
+  const openApiSection = settings?.sections.find((section) => section.id === "ctrader-open-api");
+  const openApiFieldSet = new Set(openApiSection?.fields.filter((field) => field.configured).map((field) => field.key) ?? []);
+  const openApiReady = openApiFieldSet.has("CTRADER_OPEN_API_CLIENT_ID")
+    && openApiFieldSet.has("CTRADER_OPEN_API_CLIENT_SECRET")
+    && (openApiFieldSet.has("CTRADER_OPEN_API_ACCESS_TOKEN") || openApiFieldSet.has("CTRADER_OPEN_API_REFRESH_TOKEN"));
   const pageBody = page.id === "overview" ? adapterPanel
-    : page.id === "ctrader" ? `<div class="settings-update" data-check-state="${mcpChecking ? "checking" : mcpProbeMessage.startsWith("Connection check failed") ? "error" : mcpProbeMessage ? "result" : "idle"}"><div><strong>Connection check</strong><span role="status" aria-live="polite">${escapeHtml(mcpProbeMessage || "Check the saved local MCP endpoint and account without restarting Espeon.")}</span></div><button class="secondary-button" id="probe-mcp" type="button" ${mcpChecking ? "disabled" : ""}>${mcpChecking ? "Checking…" : "Check connection"}</button></div>${sections}`
+    : page.id === "ctrader" ? `<div class="settings-update" data-check-state="${mcpChecking ? "checking" : mcpProbeMessage.startsWith("Connection check failed") ? "error" : mcpProbeMessage ? "result" : "idle"}"><div><strong>MCP account lookup</strong><span role="status" aria-live="polite">${escapeHtml(mcpProbeMessage || "Uses the active cTrader Desktop session for account and symbol details.")}</span></div><button class="secondary-button" id="probe-mcp" type="button" ${mcpChecking ? "disabled" : ""}>${mcpChecking ? "Checking…" : "Check MCP"}</button></div><div class="settings-update" data-check-state="${openApiReady ? "result" : "warning"}"><div><strong>Open API market data</strong><span>${openApiReady ? "Client credentials and an authorized token are saved. Espeon discovers the account, symbol IDs, lot size, and min/step/max trade volumes automatically." : "Optional. Add Client ID, Client secret, and an access or refresh token to enable cTrader historical bars and tick volume. Espeon discovers the account, symbol IDs, lot size, and min/step/max trade volumes automatically."}</span></div></div>${sections}`
     : page.id === "execution" ? `${settings ? riskReadinessPanel() : ""}${sections}`
     : page.id === "updates" ? `<div class="settings-update"><div><strong>Espeon updates</strong><span>${escapeHtml(updateStatus?.message ?? "Checks automatically on launch and every six hours.")}</span></div><button class="secondary-button" id="check-updates" type="button" ${updateChecking ? "disabled" : ""}>${updateChecking ? "Checking…" : "Check now"}</button></div>${sections}`
+    : page.id === "advanced" ? `<div class="settings-update"><div><strong>Espeon updates</strong><span>${escapeHtml(updateStatus?.message ?? "Checks automatically on launch and every six hours.")}</span></div><button class="secondary-button" id="check-updates" type="button" ${updateChecking ? "disabled" : ""}>${updateChecking ? "Checking…" : "Check now"}</button></div>${sections}`
     : sections;
   const content = `<form id="connector-settings-form" class="settings-form"><div class="settings-layout"><nav class="settings-nav" aria-label="Settings categories">${pages.map((item) => `<button type="button" data-settings-page="${item.id}" class="${item.id === page.id ? "is-active" : ""}" aria-current="${item.id === page.id ? "page" : "false"}">${item.label}</button>`).join("")}</nav><div class="settings-scroll"><div class="settings-page-heading"><h3>${page.title}</h3><p>${page.description}</p></div><div class="settings-page-content">${pageBody}</div></div></div><footer class="settings-actions"><p>Settings are stored locally. Connector changes apply after restarting Espeon.</p><div><button class="secondary-button" id="cancel-settings" type="button">Cancel</button><button class="primary-button" type="submit" ${state.settingsSaving ? "disabled" : ""}>${state.settingsSaving ? "Saving…" : "Save settings"}</button></div></footer></form>`;
   return `<div class="settings-backdrop" id="settings-backdrop"><section class="settings-dialog" role="dialog" aria-modal="true" aria-labelledby="settings-title"><header class="settings-header"><div><h2 id="settings-title">Settings</h2><p>Connect and configure Espeon’s providers.</p></div><button class="icon-button" id="close-settings" type="button" aria-label="Close settings" title="Close">${icons.close}</button></header>${content}</section></div>`;
@@ -319,16 +470,15 @@ function riskReadinessPanel(): string {
   const active = selected?.status === "active" && !!state.selectedRunId;
   const fieldValue = (key: string) => settings.sections.flatMap((section) => section.fields).find((field) => field.key === key)?.value ?? "";
   const instrument = selected?.hypotheses[0]?.instruments[0] ?? "";
-  const isDemo = fieldValue("CTRADER_MCP_ENVIRONMENT").trim().toLowerCase() === "demo";
-  const volumeControls = isDemo ? "" : `<label><span>Minimum order quantity (lots)</span><input name="volumeMinimum" type="number" min="0.000001" step="any" placeholder="0.01" required/></label><label><span>Order quantity increment (lots)</span><input name="volumeStep" type="number" min="0.000001" step="any" placeholder="0.01" required/></label>`;
+  const isDemo = fieldValue("CTRADER_FIX_TRADE_SENDER_COMP_ID").split(".")[0].trim().toLowerCase() === "demo";
   const riskNote = isDemo
-    ? "For this one Demo cycle, Espeon may round a positive quantity below one configured step up to one step if MCP volume limits are unavailable. cTrader may still reject that quantity."
-    : "Enter the current account values from cTrader and confirm the symbol’s volume limits. These values authorize one cycle only.";
+    ? "Espeon reads this symbol’s lot size and allowed quantity increments from cTrader Open API. Enter the current Demo account risk values; they authorize one cycle only."
+    : "Espeon reads this symbol’s lot size and allowed quantity increments from cTrader Open API. Enter the current account risk values; they authorize one cycle only.";
   const confirmation = isDemo
-    ? "I verified the active Demo account and approve one Jev cycle; if needed it may use one configured quantity step."
-    : `I checked this account in cTrader and confirm these current account values and ${escapeHtml(instrument || "symbol")} volume limits.`;
+    ? "I verified the active Demo account and approve one Jev cycle using cTrader Open API symbol limits."
+    : `I checked this account in cTrader and confirm these current account values for ${escapeHtml(instrument || "the active symbol")}.`;
   const approval = !simulated
-    ? `<form id="human-live-risk-form" class="manual-risk-approval"><strong>Human-verify one ${isDemo ? "Demo" : "live"} decision cycle</strong><p>${riskNote}</p><div class="manual-risk-identity"><label><span>Configured cTrader account</span><input name="accountId" value="${escapeHtml(fieldValue("CTRADER_MCP_ACCOUNT_ID"))}" readonly/></label><label><span>Environment</span><input name="environment" value="${escapeHtml(fieldValue("CTRADER_MCP_ENVIRONMENT"))}" readonly/></label><label><span>Active instrument</span><input name="instrument" value="${escapeHtml(instrument)}" readonly/></label></div><div class="manual-risk-grid"><label><span>Account equity</span><input name="equity" type="number" min="0.000001" step="any" required/></label><label><span>Free margin</span><input name="freeMargin" type="number" min="0" step="any" required/></label><label><span>Deposit currency</span><input name="depositCurrency" type="text" maxlength="8" placeholder="EUR" required/></label><label><span>Total open exposure</span><input name="accountOpenExposure" type="number" min="0" step="any" required/></label><label><span>${escapeHtml(instrument || "Symbol")} quote to deposit rate</span><input name="quoteToDeposit" type="number" min="0.000001" step="any" placeholder="1.0 when currencies match" required/></label>${volumeControls}</div><label class="manual-risk-confirm"><input name="confirmed" type="checkbox" required/><span>${confirmation}</span></label><button class="primary-button" type="submit" ${!active || liveRiskApprovalBusy ? "disabled" : ""}>${liveRiskApprovalBusy ? "Running one cycle…" : "Verify values and run one cycle"}</button><span class="manual-risk-result" role="status" aria-live="polite">${escapeHtml(liveRiskApprovalMessage || (active ? "This runs one immediate Jev decision cycle; it does not lower the confidence threshold." : "Select an active run before verifying a live cycle."))}</span></form>`
+    ? `<form id="human-live-risk-form" class="manual-risk-approval"><strong>Human-verify one ${isDemo ? "Demo" : "live"} decision cycle</strong><p>${riskNote}</p><div class="manual-risk-identity"><label><span>Configured cTrader account</span><input name="accountId" value="${escapeHtml(fieldValue("CTRADER_MCP_ACCOUNT_ID"))}" readonly/></label><label><span>Environment</span><input name="environment" value="${escapeHtml(fieldValue("CTRADER_MCP_ENVIRONMENT"))}" readonly/></label><label><span>Active instrument</span><input name="instrument" value="${escapeHtml(instrument)}" readonly/></label></div><div class="manual-risk-grid"><label><span>Account equity</span><input name="equity" type="number" min="0.000001" step="any" required/></label><label><span>Free margin</span><input name="freeMargin" type="number" min="0" step="any" required/></label><label><span>Deposit currency</span><input name="depositCurrency" type="text" maxlength="8" placeholder="EUR" required/></label><label><span>Total open exposure</span><input name="accountOpenExposure" type="number" min="0" step="any" required/></label><label><span>${escapeHtml(instrument || "Symbol")} quote to deposit rate</span><input name="quoteToDeposit" type="number" min="0.000001" step="any" placeholder="1.0 when currencies match" required/></label></div><label class="manual-risk-confirm"><input name="confirmed" type="checkbox" required/><span>${confirmation}</span></label><button class="primary-button" type="submit" ${!active || liveRiskApprovalBusy ? "disabled" : ""}>${liveRiskApprovalBusy ? "Running one cycle…" : "Verify values and run one cycle"}</button><span class="manual-risk-result" role="status" aria-live="polite">${escapeHtml(liveRiskApprovalMessage || (active ? "This runs one immediate Jev decision cycle; it does not lower the confidence threshold." : "Select an active run before verifying a live cycle."))}</span></form>`
     : "";
   return `<div id="order-risk-readiness" class="settings-update" data-check-state="${simulated ? "result" : "warning"}"><div><strong>Order risk gate</strong><span role="status" aria-live="polite">${escapeHtml(settings.riskReadiness)}</span></div></div>${approval}`;
 }
@@ -401,11 +551,15 @@ async function loadRun(runId: string, shouldRender = true): Promise<void> {
 async function startRun(): Promise<void> {
   const thesis = document.querySelector<HTMLTextAreaElement>("#thesis-input")?.value.trim() ?? "";
   if (!thesis) { state.notice = "Enter a thesis or market behavior first."; state.noticeTone = "error"; render(); return; }
-  const continuationFromRunId = state.tab === "home" ? null : state.selectedRunId;
-  state.loading = true; state.notice = "Starting the local autonomous run…"; state.noticeTone = "neutral"; render();
+  const activeRun = state.tab !== "home" ? currentSnapshot() : null;
+  const continuationFromRunId = state.tab === "home" || activeRun ? null : state.selectedRunId;
+  state.loading = true; state.notice = activeRun ? "Sending steering instruction to the active run…" : "Starting the local autonomous run…"; state.noticeTone = "neutral"; render();
   try {
-    const snapshot = await harnessService.startRun(thesis, continuationFromRunId); promptDraft = ""; await hydrate(false); state.selectedRunId = snapshot.runId; state.selectedLoopId = snapshot.loops[0]?.id ?? null; await loadRun(snapshot.runId, false); state.tab = "activity";
-    state.notice = continuationFromRunId ? `Continued from ${shortId(continuationFromRunId)} in a new run. The previous run was left unchanged.` : "Autonomous run started. The harness no longer requires per-trade approval."; state.noticeTone = "success";
+    const snapshot = activeRun
+      ? await harnessService.steerRun(activeRun.runId, thesis)
+      : await harnessService.startRun(thesis, continuationFromRunId);
+    promptDraft = ""; await hydrate(false); state.selectedRunId = snapshot.runId; state.selectedLoopId = snapshot.loops[0]?.id ?? null; await loadRun(snapshot.runId, false); state.tab = "activity";
+    state.notice = activeRun ? "Steering instruction queued for the next Jev decision." : continuationFromRunId ? `Continued from ${shortId(continuationFromRunId)} in a new run.` : "Autonomous run started."; state.noticeTone = "success";
   } catch (error) { state.notice = String(error); state.noticeTone = "error"; }
   finally { state.loading = false; render(); }
 }
@@ -507,7 +661,7 @@ function bindResize(handleSelector: string, side: "sidebar" | "inspector"): void
 
 async function openSettings(): Promise<void> {
   state.settingsOpen = true;
-  settingsPage = "overview";
+  settingsPage = "ctrader";
   mcpProbeMessage = "";
   state.connectorSettings = null;
   render();
@@ -541,10 +695,6 @@ async function approveHumanVerifiedLiveCycle(form: HTMLFormElement): Promise<voi
   }
   const data = new FormData(form);
   const numeric = (name: string) => Number(data.get(name));
-  const optionalNumeric = (name: string) => {
-    const value = data.get(name);
-    return value === null || value === "" ? null : Number(value);
-  };
   liveRiskApprovalBusy = true;
   liveRiskApprovalMessage = "Checking account identity and running one Jev cycle…";
   render();
@@ -559,8 +709,6 @@ async function approveHumanVerifiedLiveCycle(form: HTMLFormElement): Promise<voi
       depositCurrency: String(data.get("depositCurrency") ?? "").trim().toUpperCase(),
       accountOpenExposure: numeric("accountOpenExposure"),
       quoteToDeposit: numeric("quoteToDeposit"),
-      volumeMinimum: optionalNumeric("volumeMinimum"),
-      volumeStep: optionalNumeric("volumeStep"),
       confirmed: data.get("confirmed") === "on",
     });
     state.selectedSnapshot = result;
@@ -801,12 +949,22 @@ function bindInteractions(): void {
   document.querySelector("#connector-settings-form")?.addEventListener("submit", (event) => { event.preventDefault(); void saveSettings(); });
   document.querySelectorAll<HTMLElement>("[data-settings-page]").forEach((button) => button.addEventListener("click", () => { settingsPage = button.dataset.settingsPage ?? "overview"; render(); }));
   document.querySelectorAll<HTMLInputElement>("#connector-settings-form input[name]").forEach((input) => {
-    input.addEventListener("input", () => {
+    const updateField = () => {
       for (const section of state.connectorSettings?.sections ?? []) {
         const field = section.fields.find((candidate) => candidate.key === input.name);
-        if (field) { field.value = input.value; field.configured = input.value.length > 0; break; }
+        if (field) {
+          field.value = input.type === "checkbox" ? String(input.checked) : input.value;
+          field.configured = input.type === "checkbox" || input.value.length > 0;
+          break;
+        }
       }
-    });
+      if (input.type === "checkbox") {
+        const label = input.closest(".connector-switch")?.querySelector("i");
+        if (label) label.textContent = input.checked ? "On" : "Off";
+      }
+    };
+    input.addEventListener("input", updateField);
+    input.addEventListener("change", updateField);
   });
   document.querySelectorAll<HTMLSelectElement>("#connector-settings-form select").forEach((select) => {
     select.addEventListener("change", () => {

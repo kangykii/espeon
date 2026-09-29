@@ -148,9 +148,7 @@ impl DeterministicRiskEngine {
                     .then_some(first)
             })
             .filter(|rate| rate.is_finite() && *rate > 0.0)
-            .or_else(|| {
-                (static_policy_applies || demo_fixed_policy_applies).then_some(1.0)
-            });
+            .or_else(|| (static_policy_applies || demo_fixed_policy_applies).then_some(1.0));
         let risk_capital = snapshot
             .filter(|_| snapshot_is_fresh)
             .map(|snapshot| snapshot.equity)

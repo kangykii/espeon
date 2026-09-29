@@ -95,14 +95,8 @@ pub async fn check(
         return UpdateStatus::new("checking", "An update check is already running.", None);
     }
     let _guard = CheckGuard;
-    let Some(token) = github_token(project_root) else {
-        return UpdateStatus::new(
-            "authRequired",
-            "Connect GitHub in settings to receive private releases.",
-            None,
-        );
-    };
-    match check_authenticated(app, &token, controller, installing).await {
+    let token = github_token(project_root);
+    match check_authenticated(app, token.as_deref(), controller, installing).await {
         Ok(status) => status,
         Err(error) => UpdateStatus::new("error", error, None),
     }
@@ -110,7 +104,7 @@ pub async fn check(
 
 async fn check_authenticated(
     app: AppHandle,
-    token: &str,
+    token: Option<&str>,
     controller: Arc<Mutex<HarnessController>>,
     installing: Arc<AtomicBool>,
 ) -> Result<UpdateStatus, String> {
@@ -118,18 +112,21 @@ async fn check_authenticated(
         .timeout(Duration::from_secs(30))
         .build()
         .map_err(|error| format!("Could not prepare update check: {error}"))?;
-    let response = client
+    let mut release_request = client
         .get(RELEASE_URL)
         .header("User-Agent", "Espeon-Updater")
-        .header("Accept", "application/vnd.github+json")
-        .bearer_auth(token)
+        .header("Accept", "application/vnd.github+json");
+    if let Some(token) = token {
+        release_request = release_request.bearer_auth(token);
+    }
+    let response = release_request
         .send()
         .await
         .map_err(|error| format!("Could not reach GitHub releases: {error}"))?;
     if response.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(UpdateStatus::new(
             "authRequired",
-            "No release is available, or this GitHub account cannot access it.",
+            "No public Espeon release is available yet.",
             None,
         ));
     }
@@ -138,7 +135,7 @@ async fn check_authenticated(
     {
         return Ok(UpdateStatus::new(
             "authRequired",
-            "GitHub access expired. Update the read-only token in settings.",
+            "GitHub rejected the optional release token. Remove or replace it in settings.",
             None,
         ));
     }
@@ -158,10 +155,13 @@ async fn check_authenticated(
         .url
         .parse()
         .map_err(|error| format!("Invalid update URL: {error}"))?;
-    let update = app
-        .updater_builder()
-        .header("Authorization", format!("Bearer {token}"))
-        .map_err(|error| format!("Could not set updater authentication: {error}"))?
+    let mut updater_builder = app.updater_builder();
+    if let Some(token) = token {
+        updater_builder = updater_builder
+            .header("Authorization", format!("Bearer {token}"))
+            .map_err(|error| format!("Could not set updater authentication: {error}"))?;
+    }
+    let update = updater_builder
         .header("Accept", "application/octet-stream")
         .map_err(|error| format!("Could not set updater asset format: {error}"))?
         .endpoints(vec![endpoint])

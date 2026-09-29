@@ -12,7 +12,9 @@ __pycache__/
 node_modules/
 dist/
 src-tauri/target/
+src-tauri/target-*/
 src-tauri/gen/
+src-tauri/tauri.local-build.conf.json
 config/secrets.json
 .env
 .env.*
@@ -20,6 +22,10 @@ config/secrets.json
 *.key
 *.key.pub
 .venv/
+
+# Local diagnostics and private trading incident notes
+.tauri-restart*.log
+trauma.md
 
 runtime-btc/
 
