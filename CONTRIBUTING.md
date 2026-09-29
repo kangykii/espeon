@@ -1,6 +1,6 @@
 # Contributing to Espeon
 
-Thanks for helping improve Espeon. Until an open-source license is selected and added, please use Issues and Discussions for feedback; do not submit code pull requests. Once the license is in place, start with an Issue or Discussion for larger changes so the expected behavior can be agreed before implementation.
+Thanks for helping improve Espeon. Code contributions are welcome under the [MIT License](LICENSE). Start with an Issue or Discussion for larger changes so the expected behavior can be agreed before implementation.
 
 ## Local development
 
@@ -9,7 +9,7 @@ Thanks for helping improve Espeon. Until an open-source license is selected and 
 3. Keep credentials in an ignored `.env` file. Use simulated or cTrader Demo accounts for development.
 4. Before opening a pull request, run `npm run build`, `cargo check --manifest-path src-tauri/Cargo.toml --release`, and the relevant `cargo test --manifest-path src-tauri/Cargo.toml` checks.
 
-## Pull requests (after a license is added)
+## Pull requests
 
 - Explain the user-visible behavior and any broker/API assumptions.
 - Include a regression check for bug fixes and screenshots for visible UI changes.
@@ -19,4 +19,4 @@ Thanks for helping improve Espeon. Until an open-source license is selected and 
 
 ## License
 
-The repository's open-source license has not been selected yet. Until a `LICENSE` file is added, code reuse, redistribution, and external code contributions are not permitted. The maintainers will update this guide when the license is in place.
+Espeon is licensed under the [MIT License](LICENSE).

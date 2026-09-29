@@ -38,7 +38,7 @@ cargo test --manifest-path src-tauri/Cargo.toml
 
 ## Community and contributions
 
-Bug reports and integration feedback are welcome. Please use GitHub Issues for reproducible defects and Discussions for setup/design questions. Code pull requests will be accepted after an open-source license is selected and added. Never include API keys, account numbers, access tokens, private broker logs, or personal trading records in public reports. See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).
+Bug reports and integration feedback are welcome. Please use GitHub Issues for reproducible defects and Discussions for setup/design questions. Code pull requests are welcome; start with an Issue or Discussion for larger changes. Never include API keys, account numbers, access tokens, private broker logs, or personal trading records in public reports. See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).
 
 For targeted architecture and connector feedback, start with the [community feedback discussion](https://github.com/kangykii/espeon/discussions/10). The priority areas are cTrader MCP/Open API/FIX account and symbol mapping, startup and recovery behavior, and event/evidence retrieval.
 
@@ -46,6 +46,6 @@ For targeted architecture and connector feedback, start with the [community feed
 
 Windows installers are built and signed by GitHub Actions when a version tag is pushed. The app verifies update signatures before installation and waits while an experiment is active. Public signed releases do not need a GitHub token. See [release and signing details](docs/UPDATES.md); the updater signing private key belongs only in local secure storage and GitHub Actions secrets.
 
-## License status
+## License
 
-This repository does not yet contain an open-source license. It is public for review and community feedback, but a license must be selected before others can safely reuse, modify, or redistribute the code. See [GitHub's explanation of public repositories without a license](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/licensing-a-repository).
+This project is licensed under the [MIT License](LICENSE).
