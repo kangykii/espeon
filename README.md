@@ -36,7 +36,7 @@ cargo test --manifest-path src-tauri/Cargo.toml
 
 ## Community and contributions
 
-Bug reports, integration feedback, and pull requests are welcome. Please use GitHub Issues for reproducible defects and Discussions for setup/design questions. Never include API keys, account numbers, access tokens, private broker logs, or personal trading records in public reports. See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).
+Bug reports and integration feedback are welcome. Please use GitHub Issues for reproducible defects and Discussions for setup/design questions. Code pull requests will be accepted after an open-source license is selected and added. Never include API keys, account numbers, access tokens, private broker logs, or personal trading records in public reports. See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).
 
 ## Releases and updates
 
