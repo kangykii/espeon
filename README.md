@@ -1,5 +1,7 @@
 # Espeon Trader
 
+[![CI](https://github.com/kangykii/espeon/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/kangykii/espeon/actions/workflows/ci.yml) [![Latest release](https://img.shields.io/github/v/release/kangykii/espeon?display_name=tag)](https://github.com/kangykii/espeon/releases/latest)
+
 Espeon is an experimental Windows desktop workbench for AI-assisted trading research and supervised cTrader experiments. Its Tauri UI is backed by a Rust harness that records decisions, evidence, broker context, orders, and run state in a canonical event store.
 
 > **Trading risk:** Espeon can submit real orders when configured for a live cTrader account. AI output can be wrong, broker and market data can be delayed, and trading can lose money. Use a demo account while evaluating the software. This project is experimental and does not provide financial advice.
