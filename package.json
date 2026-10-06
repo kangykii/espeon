@@ -16,7 +16,7 @@
     "lucide": "^1.48.0"
   },
   "devDependencies": {
-    "@tauri-apps/cli": "^2.8.0",
+    "@tauri-apps/cli": "^2.12.1",
     "typescript": "^5.9.2",
     "vite": "^7.1.7"
   }
