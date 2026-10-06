@@ -12,7 +12,7 @@
   },
   "dependencies": {
     "@fontsource/ibm-plex-sans": "^5.3.0",
-    "@tauri-apps/api": "^2.8.0",
+    "@tauri-apps/api": "^2.12.1",
     "lucide": "^1.48.0"
   },
   "devDependencies": {
